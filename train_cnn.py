@@ -218,10 +218,9 @@ def main():
 
         if is_main(rank):
             print(f"Epoch {ep:03d} | train_loss {train_loss:.4f} acc {train_acc:.3f} | val_loss {val_loss:.4f} acc {val_acc:.3f} | {(time.time()-t0):.1f}s")
-            print("\n[Train Metrics]")
-            print_metrics(tr_metrics)
-            print("\n[Val Metrics]")
-            print_metrics(va_metrics)
+            # print("\n[Train Metrics]")
+            # print_metrics(tr_metrics)
+
             ckpt_path = os.path.join(args.save_dir, f"epoch{ep:03d}_acc{val_acc:.3f}.pt")
             to_save = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
             torch.save({
@@ -233,6 +232,9 @@ def main():
             }, ckpt_path)
 
         lr_sched.step()
+    if is_main(rank):
+        print("\n[Val Metrics]")
+        print_metrics(va_metrics)
 
     if world_size > 1:
         dist.destroy_process_group()
