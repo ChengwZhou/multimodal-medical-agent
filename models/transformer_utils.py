@@ -114,10 +114,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, encoder_layer: nn.Module, num_layers: int):
         super().__init__()
 
-	    # Add debug code to see what attributes TransformerLayer has
-	    # Add debug code to see what attributes TransformerLayer has
-        print("TransformerLayer attributes:", [attr for attr in dir(encoder_layer) if not attr.startswith('_')])
-
+	
         self.layers = nn.ModuleList([encoder_layer if i == 0 else type(encoder_layer)(
             encoder_layer.self_attn.d_model,
             encoder_layer.self_attn.nhead,
