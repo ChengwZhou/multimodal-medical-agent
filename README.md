@@ -6,14 +6,18 @@ The baseline leverages **Transformer-based modality sub-networks + fusion**, wit
 ---
 
 ## 📂 Project Structure
-
-├── loader.py # Data loading, EDF parsing, temporal slicing, multi-modal alignment
-├── baseline_model.py # Multi-modal baseline model with modality subnets + fusion
-├── transformer_utils.py 
+```bash
+├── utils
+    ├── filter.py
+    ├── loader.py # Data loading, EDF parsing, temporal slicing, multi-modal alignment
+    └── metrics.py
+├── models
+    ├── baseline_model.py # Multi-modal baseline model with modality subnets + fusion
+    ├── transformer_utils.py 
+    └── cnn.py
 ├── train.py # Training script (supports single GPU and DDP)
-├── utils.py # Helper functions (logging, metrics, etc.)
 └── README.md # Project documentation
-
+```
 
 ---
 
