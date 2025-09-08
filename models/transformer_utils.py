@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 
 class MultiheadSelfAttention(nn.Module):
@@ -19,21 +20,30 @@ class MultiheadSelfAttention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
-        B, L, D = x.shape
-        # project
-        q = self.q_proj(x).view(B, L, self.nhead, self.d_k).transpose(1, 2)  # [B, H, L, d_k]
-        k = self.k_proj(x).view(B, L, self.nhead, self.d_k).transpose(1, 2)
-        v = self.v_proj(x).view(B, L, self.nhead, self.d_k).transpose(1, 2)
+    
+    def forward(self, query: torch.Tensor, key: Optional[torch.Tensor] = None, 
+            value: Optional[torch.Tensor] = None, mask: torch.Tensor = None):
+        if key is None:
+            key = query
+        if value is None:
+            value = key
+            
+        B, Lq, D = query.shape
+        Lk = key.shape[1]
+        
+        # project each separately
+        q = self.q_proj(query).view(B, Lq, self.nhead, self.d_k).transpose(1, 2)
+        k = self.k_proj(key).view(B, Lk, self.nhead, self.d_k).transpose(1, 2)
+        v = self.v_proj(value).view(B, Lk, self.nhead, self.d_k).transpose(1, 2)
 
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)  # [B,H,L,L]
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
         if mask is not None:
             attn_scores = attn_scores.masked_fill(mask[:, None, None, :], float('-inf'))
         attn_probs = F.softmax(attn_scores, dim=-1)
         attn_probs = self.dropout(attn_probs)
 
-        attn_out = torch.matmul(attn_probs, v)  # [B,H,L,d_k]
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, D)
+        attn_out = torch.matmul(attn_probs, v)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, D)
         return self.o_proj(attn_out)
 
 
@@ -67,7 +77,7 @@ class CrossAttentionLayer(nn.Module):
         qn = self.ln_q(q)
         kvn = self.ln_kv(kv)
         # attention
-        out = self.attn(qn, kvn, kvn, key_padding_mask=kv_mask)  # [B, Lq, D]
+        out = self.attn(qn, kvn, kvn, mask=kv_mask)  # query, key, value, mask  # [B, Lq, D]
         q = q + self.dropout(out)
         # MLP
         q = q + self.mlp(q)
@@ -103,17 +113,19 @@ class TransformerLayer(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, encoder_layer: nn.Module, num_layers: int):
         super().__init__()
+
+	
         self.layers = nn.ModuleList([encoder_layer if i == 0 else type(encoder_layer)(
             encoder_layer.self_attn.d_model,
             encoder_layer.self_attn.nhead,
-            encoder_layer.linear1.out_features,
+            encoder_layer.mlp[1].out_features,
             encoder_layer.dropout.p
         ) for i in range(num_layers)])
 
     def forward(self, src: torch.Tensor, mask: torch.Tensor = None):
         output = src
         for mod in self.layers:
-            output = mod(output, src_mask=mask)
+            output = mod(output, x_mask=mask)
         return output
 
 
