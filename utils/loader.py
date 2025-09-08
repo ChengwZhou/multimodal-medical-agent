@@ -14,6 +14,7 @@ import re
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+import scipy.signal as sg
 
 import numpy as np
 import torch
@@ -23,6 +24,8 @@ try:
     import pyedflib
 except Exception as e:
     raise ImportError("This loader requires 'pyEDFlib'. Install via: pip install pyEDFlib")
+
+from utils.filters import apply_filter, resample_to, zscore
 
 
 # -----------------------------
@@ -92,11 +95,14 @@ EMPATICA_HINTS = {
     'w_acc': [r'ACC.*X', r'ACC.*Y', r'ACC.*Z'],
 }
 SCIENTISST_CHEST_HINTS = {
-    'ecg': [r'ECG'],
+    'ecg_gel': [r'ECG'],
+    'ecg_textile': [r'ECG'],
     'c_acc': [r'ACC.*X', r'ACC.*Y', r'ACC.*Z'],
 }
 SCIENTISST_FOREARM_HINTS = {
     'emg': [r'EMG'],
+    'eda': [r'EDA'],   # S3
+    'ppg': [r'PPG'],   # S5
 }
 
 
@@ -132,8 +138,8 @@ class MoveEDFWindowDataset(Dataset):
     def __init__(
         self,
         root: str,
-        window_sec: float = 3.0,
-        stride_sec: Optional[float] = None,
+        window_sec: float = 1.0,
+        stride_sec: Optional[float] = 0.5,
         label_map: Optional[Dict[str, int]] = None,
         min_coverage: float = 0.95,
         channel_patterns: Optional[Dict[str, List[str]]] = None,
@@ -216,6 +222,9 @@ class MoveEDFWindowDataset(Dataset):
 
         # flatten for __len__ & __getitem__ if needed
         self.flatten_index: List[Tuple[str, int]] = [(sid, i) for sid, wlist in self.index_per_subject.items() for i in range(len(wlist))]
+        self.index = []
+        for subj, windows in self.index_per_subject.items():
+            self.index.extend(windows)
 
     def _normalize_label(self, lab: str) -> str:
         # "lift-1", "lift-2" → "lift"
@@ -283,6 +292,7 @@ class MoveEDFWindowDataset(Dataset):
         t0 = wi.t0
         dur = wi.dur
 
+        # ------------------- Wrist (Empatica E4) -------------------
         wrist_sel = {
             'ppg': EMPATICA_HINTS.get('ppg', self.patterns['ppg']),
             'eda': EMPATICA_HINTS.get('eda', self.patterns['eda']),
@@ -292,36 +302,90 @@ class MoveEDFWindowDataset(Dataset):
             'az': EMPATICA_HINTS.get('w_acc', self.patterns['w_acc'][2:3]),
         }
         w_parts = self._slice_device(wi.wrist, t0, dur, wrist_sel)
-        w_acc = self._stack_axes({'x': w_parts.get('ax', np.array([])),
-                                  'y': w_parts.get('ay', np.array([])),
-                                  'z': w_parts.get('az', np.array([]))}, ['x','y','z'])
+        for k in ['ppg', 'eda', 'temp', 'ax', 'ay', 'az']:
+            if k in w_parts:
+                matched_label = _match_first(list(wi.wrist.signals.keys()), wrist_sel[k])
+                fs = wi.wrist.signals[matched_label].fs if matched_label else 100
+                if k == 'ppg':
+                    w_parts[k] = apply_filter(w_parts[k], fs, "ppg")
+                elif k == 'eda':
+                    w_parts[k] = apply_filter(w_parts[k], fs, "eda")
+                elif k in ['ax', 'ay', 'az']:
+                    w_parts[k] = apply_filter(w_parts[k], fs, "acc")
+                w_parts[k] = resample_to(w_parts[k], fs, 100)
+                w_parts[k] = zscore(w_parts[k])
+        w_acc = self._stack_axes(
+            {'x': w_parts.get('ax', np.zeros(100)),
+             'y': w_parts.get('ay', np.zeros(100)),
+             'z': w_parts.get('az', np.zeros(100))},
+            ['x', 'y', 'z']
+        )
 
+        # ------------------- Chest (ScientISST Chest) -------------------
         chest_sel = {
-            'ecg': SCIENTISST_CHEST_HINTS.get('ecg', self.patterns['ecg']),
+            'ecg_gel': SCIENTISST_CHEST_HINTS.get('ecg_gel', self.patterns['ecg']),
+            'ecg_textile': SCIENTISST_CHEST_HINTS.get('ecg_textile', self.patterns['ecg']),
             'cx': SCIENTISST_CHEST_HINTS.get('c_acc', self.patterns['c_acc'][0:1]),
             'cy': SCIENTISST_CHEST_HINTS.get('c_acc', self.patterns['c_acc'][1:2]),
             'cz': SCIENTISST_CHEST_HINTS.get('c_acc', self.patterns['c_acc'][2:3]),
         }
         c_parts = self._slice_device(wi.chest, t0, dur, chest_sel)
-        c_acc = self._stack_axes({'x': c_parts.get('cx', np.array([])),
-                                  'y': c_parts.get('cy', np.array([])),
-                                  'z': c_parts.get('cz', np.array([]))}, ['x','y','z'])
 
+        for k in ['ecg_gel', 'ecg_textile']:
+            if k in c_parts:
+                matched_label = _match_first(list(wi.chest.signals.keys()), chest_sel[k])
+                fs = wi.chest.signals[matched_label].fs if matched_label else 100
+                c_parts[k] = apply_filter(c_parts[k], fs, "ecg")
+                c_parts[k] = resample_to(c_parts[k], fs, 100)
+                c_parts[k] = zscore(c_parts[k])
+        for k in ['cx', 'cy', 'cz']:
+            if k in c_parts:
+                matched_label = _match_first(list(wi.chest.signals.keys()), chest_sel['cx'])
+                fs = wi.chest.signals[matched_label].fs if matched_label else 100
+                c_parts[k] = apply_filter(c_parts[k], fs, "acc")
+                c_parts[k] = resample_to(c_parts[k], fs, 100)
+                c_parts[k] = zscore(c_parts[k])
+        c_acc = self._stack_axes(
+            {'x': c_parts.get('cx', np.zeros(100)),
+             'y': c_parts.get('cy', np.zeros(100)),
+             'z': c_parts.get('cz', np.zeros(100))},
+            ['x', 'y', 'z']
+        )
+
+        # ------------------- Forearm (ScientISST Forearm) -------------------
         fore_sel = {
-            'emg': SCIENTISST_FOREARM_HINTS.get('emg', self.patterns['emg'])
+            'emg': SCIENTISST_FOREARM_HINTS.get('emg', self.patterns['emg']),
+            'eda': SCIENTISST_FOREARM_HINTS.get('eda', self.patterns['eda']),
+            'ppg': SCIENTISST_FOREARM_HINTS.get('ppg', self.patterns['ppg']),
         }
         f_parts = self._slice_device(wi.forearm, t0, dur, fore_sel)
 
+        for k in ['emg', 'eda', 'ppg']:
+            if k in f_parts:
+                matched_label = _match_first(list(wi.forearm.signals.keys()), fore_sel[k])
+                fs = wi.forearm.signals[matched_label].fs if matched_label else 100
+                if k == 'eda':
+                    f_parts[k] = apply_filter(f_parts[k], fs, "eda")
+                elif k == 'ppg':
+                    f_parts[k] = apply_filter(f_parts[k], fs, "ppg")
+                f_parts[k] = resample_to(f_parts[k], fs, 100)
+                f_parts[k] = zscore(f_parts[k])
+
+        # ------------------- Pack all sensors -------------------
         x_dict_np = {
-            'ecg': np.expand_dims(c_parts['ecg'], 0),
-            'ppg': np.expand_dims(w_parts['ppg'], 0),
-            'eda': np.expand_dims(w_parts['eda'], 0),
-            'emg': np.expand_dims(f_parts['emg'], 0),
-            'temp': np.expand_dims(w_parts['temp'], 0),
-            'c_acc': c_acc,
-            'w_acc': w_acc,
+            'ecg_chest_gel': np.expand_dims(c_parts.get('ecg_gel', np.zeros(100)), 0),
+            'ecg_chest_textile': np.expand_dims(c_parts.get('ecg_textile', np.zeros(100)), 0),
+            'eda_forearm_scientisst': np.expand_dims(f_parts.get('eda', np.zeros(100)), 0),
+            'eda_wrist_e4': np.expand_dims(w_parts.get('eda', np.zeros(100)), 0),
+            'ppg_forearm_scientisst': np.expand_dims(f_parts.get('ppg', np.zeros(100)), 0),
+            'ppg_wrist_e4': np.expand_dims(w_parts.get('ppg', np.zeros(100)), 0),
+            'emg_forearm': np.expand_dims(f_parts.get('emg', np.zeros(100)), 0),
+            'temp_wrist': np.expand_dims(w_parts.get('temp', np.zeros(100)), 0),
+            'c_acc': c_acc,  # shape [3, 100]
+            'w_acc': w_acc,  # shape [3, 100]
         }
-        x_dict = {k: torch.from_numpy(v.copy()) for k, v in x_dict_np.items()}
+
+        x_dict = {k: torch.from_numpy(v.copy().astype(np.float32)) for k, v in x_dict_np.items()}
         return x_dict, wi.y
 
     # -----------------------------

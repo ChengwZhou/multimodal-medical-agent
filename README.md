@@ -90,11 +90,11 @@ The baseline model consists of:
 ## 🚀 Training
 Single GPU
 ```bash
-python train.py --epochs 50 --batch_size 64 --lr 1e-4
+python train.py --epochs 50 --batch_size 64 --lr 1e-4 --data_root ...
 ```
 Multi-GPU (DDP)
 ```bash
-torchrun --nproc_per_node=4 train.py --epochs 50 --batch_size 64 --lr 1e-4 --ddp
+torchrun --nproc_per_node=4 train.py --epochs 50 --batch_size 64 --lr 1e-4 --data_root ...
 ```
 Arguments
 ```bash

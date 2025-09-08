@@ -15,7 +15,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset, DistributedSampler
 
-from models.baseline_model import build_baseline_model
+from models.cnn import CNN1DModel
 from utils.loader import MoveEDFWindowDataset, split_by_subject
 from utils.metrics import compute_metrics, print_metrics
 
@@ -49,12 +49,25 @@ def train_patient_sequence(model, seq: List, optimizer, scaler, device, ce):
     all_preds, all_labels = [], []
 
     for x, y in seq:
-        x = {k: v.to(device, non_blocking=True).unsqueeze(0) for k, v in x.items()}  # add batch dim 1
+        # x = {k: v.to(device, non_blocking=True).unsqueeze(0) for k, v in x.items()}  # add batch dim 1
+        x = torch.cat([
+            x['ecg_chest_gel'],
+            x['ecg_chest_textile'],
+            x['eda_forearm_scientisst'],
+            x['eda_wrist_e4'],
+            x['ppg_forearm_scientisst'],
+            x['ppg_wrist_e4'],
+            x['emg_forearm'],
+            x['temp_wrist'],
+            x['c_acc'],
+            x['w_acc'],
+        ], dim=0).unsqueeze(0)
+        x = x.to(device)
         y = torch.tensor([y], dtype=torch.long, device=device) if y is not None else torch.tensor([-1], device=device)
 
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-            logits, h = model(x, history=h)
+            logits = model(x)
             loss = ce(logits, y)
 
         scaler.scale(loss).backward()
@@ -90,10 +103,23 @@ def evaluate_patient(model, seq: List, device, ce):
 
     with torch.no_grad():
         for x, y in seq:
-            x = {k: v.to(device, non_blocking=True).unsqueeze(0) for k, v in x.items()}
+            # x = {k: v.to(device, non_blocking=True).unsqueeze(0) for k, v in x.items()}  # add batch dim 1
+            x = torch.cat([
+                x['ecg_chest_gel'],
+                x['ecg_chest_textile'],
+                x['eda_forearm_scientisst'],
+                x['eda_wrist_e4'],
+                x['ppg_forearm_scientisst'],
+                x['ppg_wrist_e4'],
+                x['emg_forearm'],
+                x['temp_wrist'],
+                x['c_acc'],
+                x['w_acc'],
+            ], dim=0).unsqueeze(0)
+            x = x.to(device)
             y = torch.tensor([y], dtype=torch.long, device=device) if y is not None else torch.tensor([-1], device=device)
 
-            logits, h = model(x, history=h)
+            logits = model(x)
             loss = ce(logits, y)
             running_loss += loss.item()
             nstep += 1
@@ -155,7 +181,7 @@ def main():
 
     # subjects = dataset.subjects
     num_classes = len(dataset.label_map)
-    model = build_baseline_model(num_classes=num_classes)
+    model = CNN1DModel(num_classes=num_classes)
     model.to(device)
     if world_size > 1:
         model = DDP(model, device_ids=[device.index], output_device=device.index, find_unused_parameters=False)
