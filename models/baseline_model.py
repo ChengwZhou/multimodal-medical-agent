@@ -4,7 +4,7 @@ from typing import Dict, Optional, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformer_utils import CrossAttentionLayer, TransformerLayer, TransformerBlock
+from models.transformer_utils import CrossAttentionLayer, TransformerLayer, TransformerBlock
 
 
 # -----------------------------

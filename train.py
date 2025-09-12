@@ -50,6 +50,7 @@ def train_patient_sequence(model, seq: List, optimizer, scaler, device, ce):
 
     for x, y in seq:
         x = {k: v.to(device, non_blocking=True).unsqueeze(0) for k, v in x.items()}  # add batch dim 1
+        print(x.size())
         y = torch.tensor([y], dtype=torch.long, device=device) if y is not None else torch.tensor([-1], device=device)
 
         optimizer.zero_grad(set_to_none=True)
@@ -60,6 +61,9 @@ def train_patient_sequence(model, seq: List, optimizer, scaler, device, ce):
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+
+        if h is not None:
+            h = h.detach()
 
         running_loss += loss.item()
         nstep += 1
@@ -91,12 +95,16 @@ def evaluate_patient(model, seq: List, device, ce):
     with torch.no_grad():
         for x, y in seq:
             x = {k: v.to(device, non_blocking=True).unsqueeze(0) for k, v in x.items()}
-            y = torch.tensor([y], dtype=torch.long, device=device) if y is not None else torch.tensor([-1], device=device)
+            y = torch.tensor([y], dtype=torch.long, device=device) if y is not None else torch.tensor([-1],
+                                                                                                      device=device)
 
             logits, h = model(x, history=h)
             loss = ce(logits, y)
             running_loss += loss.item()
             nstep += 1
+
+            if h is not None:
+                h = h.detach()
 
             pred = logits.argmax(dim=1)
             mask = y != -1
@@ -129,18 +137,23 @@ def main():
     args = parser.parse_args()
 
     rank, world_size = ddp_setup()
-    device = torch.device('cuda', rank % torch.cuda.device_count()) if torch.cuda.is_available() else torch.device('cpu')
+    device = torch.device('cuda', rank % torch.cuda.device_count()) if torch.cuda.is_available() else torch.device(
+        'cpu')
 
-    dataset = MoveEDFWindowDataset(root=args.data_root, window_sec=args.window_sec, stride_sec=args.stride_sec, none_policy="extra_class")
+    dataset = MoveEDFWindowDataset(root=args.data_root, window_sec=args.window_sec, stride_sec=args.stride_sec,
+                                   none_policy="extra_class")
     train_idx, val_idx = split_by_subject(dataset, val_ratio=0.2)
 
     def idx_to_subject_windows(idx_list):
         subj_dict = {}
         for i in idx_list:
-            wi = dataset.index[i]
-            if wi.subject_id not in subj_dict:
-                subj_dict[wi.subject_id] = []
-            subj_dict[wi.subject_id].append((dataset[i][0], dataset[i][1]))
+            # Get subject_id and window index from the flatten_index
+            subject_id, window_idx = dataset.flatten_index[i]
+            if subject_id not in subj_dict:
+                subj_dict[subject_id] = []
+            # Get the actual data for this window
+            x, y = dataset[i]
+            subj_dict[subject_id].append((x, y))
         return subj_dict
 
     train_subj_seq = idx_to_subject_windows(train_idx)
@@ -191,7 +204,8 @@ def main():
         val_acc /= max(1, n_subj)
 
         if is_main(rank):
-            print(f"Epoch {ep:03d} | train_loss {train_loss:.4f} acc {train_acc:.3f} | val_loss {val_loss:.4f} acc {val_acc:.3f} | {(time.time()-t0):.1f}s")
+            print(
+                f"Epoch {ep:03d} | train_loss {train_loss:.4f} acc {train_acc:.3f} | val_loss {val_loss:.4f} acc {val_acc:.3f} | {(time.time() - t0):.1f}s")
             print("\n[Train Metrics]")
             print_metrics(tr_metrics)
             print("\n[Val Metrics]")

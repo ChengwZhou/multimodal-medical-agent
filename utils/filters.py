@@ -1,6 +1,6 @@
 import scipy.signal as sg
 import numpy as np
-
+from scipy.signal import resample_poly
 
 # -----------------------------
 # Filtering helpers
@@ -36,8 +36,7 @@ def apply_filter(x, fs, mode="ecg"):
 def resample_to(x, orig_fs, target_fs=100):
     if orig_fs == target_fs:
         return x
-    n_samples = int(len(x) * target_fs / orig_fs)
-    return sg.resample(x, n_samples)
+    return resample_poly(x, target_fs, orig_fs)
 
 
 def zscore(x):
