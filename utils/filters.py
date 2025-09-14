@@ -21,7 +21,7 @@ def apply_filter(x, fs, mode="ecg"):
     if len(x) < 16:
         return x
     if mode == "ecg":
-        b, a = butter_bandpass(39, 41, fs)
+        b, a = butter_bandpass(1, 40, fs)
     elif mode == "ppg":
         b, a = butter_bandpass(0.5, 5, fs)
     elif mode == "eda":

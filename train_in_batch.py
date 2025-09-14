@@ -15,6 +15,7 @@ from models.cnn import CNN1DModel
 from models.cnn_res import CNN1DResidual
 from models.cnn_res_v2 import CNN1DResidualV2
 from models.cnn_lstm import CNNLSTM
+from models.former import build_former
 from utils.mHEALTH_loader import MHealthDataset
 from utils.SiScientISST_MOVE_loader import MoveEDFWindowDataset, split_by_subject, filter_labels
 from utils.metrics import compute_metrics, print_metrics
@@ -244,7 +245,8 @@ def main():
                                   num_workers=args.num_workers, pin_memory=True, collate_fn=simple_collate, drop_last=False)
         val_loader = DataLoader(val_subset, batch_size=args.batch_size, sampler=val_sampler, shuffle=False, num_workers=args.num_workers,
                                 pin_memory=True, collate_fn=simple_collate, drop_last=False)
-        model = CNN1DResidual(num_modal=14, num_classes=num_classes)
+        # model = CNN1DResidualV2(num_modal=14, num_classes=num_classes)
+        model = build_former(num_modal=14, num_classes=num_classes, model_dim=32)
 
     else:
         train_subset = MHealthDataset(args.data_root, subjects=[i for i in range(1, 9)], time_steps=100, step=50, balance=False, majority_n=500)  # 50 Hz
