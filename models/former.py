@@ -185,7 +185,7 @@ def build_former(num_modal=14, num_classes=10, model_dim=32):
         num_classes=num_classes,
         model_dim=model_dim,
         nhead=8,
-        fusion_depth=3,
+        fusion_depth=1,
         ff_dim=4*model_dim,
         dropout=0.1,
         modalities=modalities,
