@@ -9,7 +9,7 @@ The baseline leverages **Transformer-based modality sub-networks + fusion**, wit
 ```bash
 ├── utils
     ├── filter.py
-    ├── loader.py # Data loading, EDF parsing, temporal slicing, multi-modal alignment
+    ├── SiScientISST_MOVE_loader.py # Data loading, EDF parsing, temporal slicing, multi-modal alignment
     └── metrics.py
 ├── models
     ├── baseline_model.py # Multi-modal baseline model with modality subnets + fusion

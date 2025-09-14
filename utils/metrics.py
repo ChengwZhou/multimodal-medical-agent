@@ -37,3 +37,5 @@ def print_metrics(metrics):
     print(f"F1-score: {metrics['f1_score']:.4f}")
     print("Confusion Matrix:")
     print(metrics["confusion_matrix"])
+
+

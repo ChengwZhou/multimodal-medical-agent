@@ -3,7 +3,7 @@
 import argparse
 import os
 import time
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,7 +13,10 @@ from torch.utils.data import DataLoader, Subset, DistributedSampler
 
 from models.cnn import CNN1DModel
 from models.cnn_res import CNN1DResidual
-from utils.loader_filter_after_seg import MoveEDFWindowDataset, split_by_subject, filter_labels
+from models.cnn_res_v2 import CNN1DResidualV2
+from models.cnn_lstm import CNNLSTM
+from utils.mHEALTH_loader import MHealthDataset
+from utils.SiScientISST_MOVE_loader import MoveEDFWindowDataset, split_by_subject, filter_labels
 from utils.metrics import compute_metrics, print_metrics
 
 
@@ -69,46 +72,19 @@ def is_main(rank: int) -> bool:
 # -----------------------
 # collate fn: convert list[(x_dict, y)] -> (x_batch [B,C,T], y_batch [B])
 # -----------------------
-def collate_windows(batch: List):
+def simple_collate(batch: List[Tuple[torch.Tensor, int]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Simple collate function since tensors are already integrated
+    """
     xs = []
     ys = []
-    for x_dict, y in batch:
-        # x_dict entries are torch tensors, shapes:
-        # single-channel: [1, T]; c_acc: [3, T]; w_acc: [3, T]
-        parts = [
-            x_dict['ecg_chest_gel'],
-            x_dict['ecg_chest_textile'],
-            x_dict['eda_forearm_scientisst'],
-            x_dict['eda_wrist_e4'],
-            x_dict['ppg_forearm_scientisst'],
-            x_dict['ppg_wrist_e4'],
-            x_dict['emg_forearm'],
-            x_dict['temp_wrist'],
-        ]
-        # ensure all single-channel parts are [1,T]
-        parts = [p if p.dim() == 2 else p.unsqueeze(0) for p in parts]
-
-        # expand accs into 3 separate channels each
-        c_acc = x_dict['c_acc']  # [3, T] (or maybe zeros)
-        w_acc = x_dict['w_acc']  # [3, T]
-        # ensure dims
-        if c_acc.dim() == 1:
-            c_acc = c_acc.unsqueeze(0)
-        if w_acc.dim() == 1:
-            w_acc = w_acc.unsqueeze(0)
-        # now unbind channels
-        c_chs = list(torch.unbind(c_acc, dim=0))  # three [T] -> each [T] -> make [1,T]
-        c_chs = [ch.unsqueeze(0) if ch.dim() == 1 else ch for ch in c_chs]
-        w_chs = list(torch.unbind(w_acc, dim=0))
-        w_chs = [ch.unsqueeze(0) if ch.dim() == 1 else ch for ch in w_chs]
-
-        all_parts = parts + c_chs + w_chs  # list of [1,T] tensors, len=14
-        x_cat = torch.cat(all_parts, dim=0)  # [C=14, T]
-        xs.append(x_cat)
-        ys.append(-1 if y is None else int(y))
+    for x_tensor, y in batch:
+        xs.append(x_tensor)
+        ys.append(y)
 
     x_batch = torch.stack(xs, dim=0)  # [B, C, T]
     y_batch = torch.tensor(ys, dtype=torch.long)
+
     return x_batch, y_batch
 
 
@@ -124,7 +100,7 @@ def train_epoch(model, loader, optimizer, scaler, device, criterion, epoch, rank
     for xb, yb in loader:
         xb = xb.to(device, non_blocking=True)
         yb = yb.to(device, non_blocking=True)
-        mask = yb != -1
+        mask = yb != -100
 
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
@@ -174,7 +150,7 @@ def eval_epoch(model, loader, device, criterion, epoch, rank, world_size):
         for xb, yb in loader:
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
-            mask = yb != -1
+            mask = yb != -100
 
             logits = model(xb)
             loss = criterion(logits, yb)
@@ -219,6 +195,7 @@ def eval_epoch(model, loader, device, criterion, epoch, rank, world_size):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', required=True)
+    parser.add_argument('--dataset', type=str, default='siscientisst')
     parser.add_argument('--window_sec', type=float, default=1.0)
     parser.add_argument('--stride_sec', type=float, default=0.5)
     parser.add_argument('--epochs', type=int, default=30)
@@ -228,6 +205,7 @@ def main():
     parser.add_argument('--save_dir', type=str, default='./checkpoints')
     parser.add_argument('--eval_interval', type=int, default=5,
                         help='Evaluate every N epochs')
+    parser.add_argument('--force_data_prep', action='store_true')
 
     # DDP address arguments
     parser.add_argument('--master_addr', type=str, default=None,
@@ -240,65 +218,63 @@ def main():
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
 
     # dataset & split
-    dataset = MoveEDFWindowDataset(root=args.data_root, window_sec=args.window_sec, stride_sec=args.stride_sec,
-                                   none_policy="extra_class")
-    dataset = filter_labels(dataset, remove_labels=["sprint"])
-    train_idx, val_idx = split_by_subject(dataset, val_ratio=0.2)
+    if args.dataset == 'siscientisst':
+        dataset = MoveEDFWindowDataset(root=args.data_root, window_sec=args.window_sec, stride_sec=args.stride_sec,
+                                       none_policy="ignore", force_reprocess=args.force_data_prep)
+        dataset = filter_labels(dataset, remove_labels=["sprint", "jumps"])
+        train_idx, val_idx = split_by_subject(dataset, val_ratio=0.2)
+        num_classes = len(dataset.label_map)
+        # # compute class weights
+        # train_labels = [dataset[i][1] for i in train_idx if dataset[i][1] is not None]
+        # counts = torch.bincount(torch.tensor(train_labels), minlength=num_classes)
+        # total = counts.sum().item()
+        # weights = total / (num_classes * counts.float().clamp(min=1))# , 60.840476989746094 4
+        weights = torch.tensor([14.303363800048828, 13.314342498779297, 30.003421783447266, 30.785348892211914, 0.17281104624271393, 13.78414249420166, 2.526700496673584])
+        weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
+        if is_main(rank):
+            print("Class map:", dataset.label_map)
+            # print("Class counts:", counts.tolist())  # Class counts: [545, 2352, 974, 280, 1629, 45109, 2060, 5106, 12103]
+            print("Class weights:", weights.tolist())
+        # use Subset over flattened indices
+        train_subset = Subset(dataset, train_idx)
+        val_subset = Subset(dataset, val_idx)
+        train_sampler = DistributedSampler(train_subset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+        val_sampler = DistributedSampler(val_subset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
+        train_loader = DataLoader(train_subset, batch_size=args.batch_size, sampler=train_sampler, shuffle=(train_sampler is None),
+                                  num_workers=args.num_workers, pin_memory=True, collate_fn=simple_collate, drop_last=False)
+        val_loader = DataLoader(val_subset, batch_size=args.batch_size, sampler=val_sampler, shuffle=False, num_workers=args.num_workers,
+                                pin_memory=True, collate_fn=simple_collate, drop_last=False)
+        model = CNN1DResidual(num_modal=14, num_classes=num_classes)
 
-    # # compute class weights
-    # num_classes = len(dataset.label_map)
-    # train_labels = [dataset[i][1] for i in train_idx if dataset[i][1] is not None]
-    # counts = torch.bincount(torch.tensor(train_labels), minlength=num_classes)
-    # total = counts.sum().item()
-    # weights = total / (num_classes * counts.float().clamp(min=1))
-    # weights = [14.303363800048828, 3.314342498779297, 8.003421783447266, 27.840476989746094, 4.785348892211914, 0.17281104624271393, 3.78414249420166, 1.5267006158828735, 0.6440827250480652]
-    weights = torch.tensor([40, 5, 20, 60, 20, 0.1, 4, 1.5, 0.7], dtype=torch.float)
-    weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
-    if is_main(rank):
-        # print("Class counts:", counts.tolist())
-        print("Class weights:", weights.tolist())
+    else:
+        train_subset = MHealthDataset(args.data_root, subjects=[i for i in range(1, 9)], time_steps=100, step=50, balance=False, majority_n=500)  # 50 Hz
+        val_subset = MHealthDataset(args.data_root, subjects=[9, 10], time_steps=100, step=50, balance=False, majority_n=120)
+        train_sampler = DistributedSampler(train_subset, num_replicas=world_size, rank=rank,
+                                           shuffle=True) if world_size > 1 else None
+        # val_sampler = DistributedSampler(val_subset, num_replicas=world_size, rank=rank,
+        #                                  shuffle=False) if world_size > 1 else None
+        train_loader = DataLoader(train_subset, batch_size=args.batch_size, sampler=train_sampler, shuffle=(train_sampler is None),
+                                 num_workers=args.num_workers, pin_memory=True, drop_last=False)
+        val_loader = DataLoader(val_subset, batch_size=args.batch_size, shuffle=False,
+                                num_workers=args.num_workers, pin_memory=True, drop_last=False)
+        num_classes = 12
+        weights = torch.tensor([1,1,1,1,1,1,1,1,1,1,1,1])
+        weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
 
-    # use Subset over flattened indices
-    train_subset = Subset(dataset, train_idx)
-    val_subset = Subset(dataset, val_idx)
+        # model = CNNLSTM(input_dim=12, num_classes=num_classes)
+        model = CNN1DResidualV2(num_modal=12, num_classes=num_classes)
 
-    # distributed samplers
-    train_sampler = DistributedSampler(train_subset, num_replicas=world_size, rank=rank,
-                                       shuffle=True) if world_size > 1 else None
-    val_sampler = DistributedSampler(val_subset, num_replicas=world_size, rank=rank,
-                                     shuffle=False) if world_size > 1 else None
-
-    train_loader = DataLoader(
-        train_subset,
-        batch_size=args.batch_size,
-        sampler=train_sampler,
-        shuffle=(train_sampler is None),
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collate_windows,
-        drop_last=False
-    )
-    val_loader = DataLoader(
-        val_subset,
-        batch_size=args.batch_size,
-        sampler=val_sampler,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collate_windows,
-        drop_last=False
-    )
-
-    num_classes = len(dataset.label_map)
-    model = CNN1DResidual(num_classes=num_classes)
     model.to(device)
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     lr_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
-    criterion = nn.CrossEntropyLoss(ignore_index=-1).to(device)
+    if args.dataset == 'siscientisst':
+        criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=-100).to(device)
+    else:
+        criterion = nn.CrossEntropyLoss(ignore_index=-100).to(device)
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -335,7 +311,7 @@ def main():
                 'optimizer': optimizer.state_dict(),
                 'lr_sched': lr_sched.state_dict(),
                 'scaler': scaler.state_dict(),
-                'label_map': dataset.label_map,
+                # 'label_map': dataset.label_map,
             }, ckpt_path)
 
         lr_sched.step()
