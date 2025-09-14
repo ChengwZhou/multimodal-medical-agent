@@ -17,7 +17,7 @@ from models.cnn_res_v2 import CNN1DResidualV2
 from models.cnn_lstm import CNNLSTM
 from models.former import build_former
 from utils.mHEALTH_loader import MHealthDataset
-from utils.SiScientISST_MOVE_loader import MoveEDFWindowDataset, split_by_subject, filter_labels
+from utils.ScientISST_MOVE_loader import MoveEDFWindowDataset, split_by_subject, filter_labels
 from utils.metrics import compute_metrics, print_metrics
 
 

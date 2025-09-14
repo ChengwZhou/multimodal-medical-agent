@@ -16,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset, DistributedSampler
 
 from models.former import build_baseline_model
-from utils.SiScientISST_MOVE_loader import MoveEDFWindowDataset, split_by_subject
+from utils.ScientISST_MOVE_loader import MoveEDFWindowDataset, split_by_subject
 from utils.metrics import compute_metrics, print_metrics
 
 
