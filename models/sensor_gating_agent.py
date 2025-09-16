@@ -47,28 +47,23 @@ class SensorGatingAgent(nn.Module):
             nn.Linear(hidden_dim // 2, num_modalities)
         )
 
-        # LSTM: input size = 2M (gate_features + sensor_states)
-        self.lstm = nn.LSTM(
-            input_size=num_modalities * 2,
-            hidden_size=hidden_dim,
-            num_layers=2,
-            batch_first=True,
-            dropout=0.1
-        )
-
-        # decision heads (保留)
-        self.decision_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.ReLU(),
-                nn.Linear(hidden_dim // 2, 3)
-            ) for _ in range(num_modalities)
-        ])
-
-        # 可学习阈值（保留，但在 Gumbel-Sigmoid 流程里可以作为辅助或后处理）
-        self.activation_logit = nn.Parameter(torch.full((num_modalities,), float(thresh_init)))
-        self.deactivation_logit = nn.Parameter(torch.full((num_modalities,), float(thresh_init)))
-        self.confidence_logit = nn.Parameter(torch.full((num_modalities,), float(thresh_init)))
+        # # LSTM: input size = 2M (gate_features + sensor_states)
+        # self.lstm = nn.LSTM(
+        #     input_size=num_modalities * 2,
+        #     hidden_size=hidden_dim,
+        #     num_layers=2,
+        #     batch_first=True,
+        #     dropout=0.1
+        # )
+        #
+        # # decision heads (保留)
+        # self.decision_heads = nn.ModuleList([
+        #     nn.Sequential(
+        #         nn.Linear(hidden_dim, hidden_dim // 2),
+        #         nn.ReLU(),
+        #         nn.Linear(hidden_dim // 2, 3)
+        #     ) for _ in range(num_modalities)
+        # ])
 
     def _thresh_sigmoid(self, logit_param: torch.Tensor) -> torch.Tensor:
         s = torch.sigmoid(logit_param)
@@ -109,8 +104,6 @@ class SensorGatingAgent(nn.Module):
     def forward(self,
                 represent_features: torch.Tensor,
                 sensor_history: torch.Tensor,
-                gate_history: Optional[torch.Tensor] = None,
-                hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_straight_through: bool = True
                 ) -> Dict[str, torch.Tensor]:
         """
@@ -121,37 +114,14 @@ class SensorGatingAgent(nn.Module):
             dict with:
               - 'p_soft': [B, M] continuous probabilities (train)
               - 'p_st': [B, M] ST forward (hard in forward, grad flows from p_soft)
-              - 'decision_logits': [B, M, 3]
+              - 'current_gate_logits': [B, M]
               - 'energy_cost': [B] (approx)
               - 'state_changes': [B]
-              - other context info
         """
-        B = represent_features.shape[0]
-        M = self.num_modalities
-        T = sensor_history.shape[1]
-        device = represent_features.device
-
         current_sensor_states = sensor_history[:, -1, :]  # [B, M]
 
         # gate logits from represent features (via extractor)
         gate_logits = self.extract_modality_features(represent_features)  # [B, M]
-
-        # LSTM input construction (use gate logits as 'gate features' in history)
-        if gate_history is None:
-            if T == 1:
-                lstm_gate_seq = gate_logits.unsqueeze(1)  # [B,1,M]
-            else:
-                zeros = torch.zeros((B, T - 1, M), device=device)
-                lstm_gate_seq = torch.cat([zeros, gate_logits.unsqueeze(1)], dim=1)  # [B,T,M]
-        else:
-            lstm_gate_seq = torch.cat([gate_history, gate_logits.unsqueeze(1)], dim=1)  # [B,T,M]
-
-        lstm_input = torch.cat([lstm_gate_seq, sensor_history], dim=-1)  # [B, T, 2M]
-        lstm_out, new_hidden_state = self.lstm(lstm_input, hidden_state)
-        context = lstm_out[:, -1, :]  # [B, hidden_dim]
-
-        decision_logits = torch.stack([head(context) for head in self.decision_heads], dim=1)  # [B, M, 3]
-        decision_probs = F.softmax(decision_logits, dim=-1)
 
         # ---------- Gumbel-Sigmoid gating ----------
         if self.training:
@@ -182,12 +152,9 @@ class SensorGatingAgent(nn.Module):
             'p_soft': p_soft,                      # [B, M] continuous probabilities
             'p_hard': p_hard,                      # [B, M] hard rounded
             'p_st': p_st,                          # [B, M] straight-through state (forward hard, backward soft)
-            'decision_logits': decision_logits,    # [B, M, 3]
             'current_gate_logits': gate_logits,    # [B, M]
             'energy_cost': energy_cost,            # [B]
             'state_changes': state_changes,        # [B]
-            'hidden_state': new_hidden_state,
-            'context_vector': context
         }
 
     def _compute_state_duration(self, sensor_history: torch.Tensor) -> torch.Tensor:

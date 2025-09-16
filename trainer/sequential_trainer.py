@@ -197,7 +197,7 @@ class SequentialTrainer:
 
         # Wrap with DDP if needed
         if self.is_ddp:
-            self.model = DDP(self.model, device_ids=[self.rank])
+            self.model = DDP(self.model, device_ids=[self.rank], find_unused_parameters=True)
 
         # Setup optimizer with warmup
         self.optimizer = torch.optim.AdamW(
