@@ -6,17 +6,15 @@
 import argparse
 import time
 import os
-from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Subset, DistributedSampler
 
 from models.cnn import CNN1DModel
-from utils.ScientISST_MOVE_loader import MoveEDFWindowDataset, split_by_subject
+from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, split_by_subject
 from utils.metrics import compute_metrics, print_metrics
 
 
@@ -157,7 +155,7 @@ def main():
     rank, world_size = ddp_setup()
     device = torch.device('cuda', rank % torch.cuda.device_count()) if torch.cuda.is_available() else torch.device('cpu')
 
-    dataset = MoveEDFWindowDataset(root=args.data_root, window_sec=args.window_sec, stride_sec=args.stride_sec, none_policy="extra_class")
+    dataset = ScientISSTMOVEDataset(root=args.data_root, window_sec=args.window_sec, stride_sec=args.stride_sec, none_policy="extra_class")
     train_idx, val_idx = split_by_subject(dataset, val_ratio=0.2)
 
     def idx_to_subject_windows(idx_list):

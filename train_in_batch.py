@@ -2,8 +2,7 @@
 # DDP batch-based training for MoveEDF windows
 import argparse
 import os
-import time
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
@@ -11,13 +10,10 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset, DistributedSampler
 
-from models.cnn import CNN1DModel
-from models.cnn_res import CNN1DResidual
 from models.cnn_res_v2 import CNN1DResidualV2
-from models.cnn_lstm import CNNLSTM
 from models.former import build_former
-from utils.mHEALTH_loader import MHealthDataset
-from utils.ScientISST_MOVE_loader import MoveEDFWindowDataset, split_by_subject, filter_labels
+from dataset.mHEALTH_loader import MHealthDataset
+from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, split_by_subject, filter_labels
 from utils.metrics import compute_metrics, print_metrics
 
 
@@ -220,8 +216,8 @@ def main():
 
     # dataset & split
     if args.dataset == 'siscientisst':
-        dataset = MoveEDFWindowDataset(root=args.data_root, window_sec=args.window_sec, stride_sec=args.stride_sec,
-                                       none_policy="ignore", force_reprocess=args.force_data_prep)
+        dataset = ScientISSTMOVEDataset(root=args.data_root, window_sec=args.window_sec, stride_sec=args.stride_sec,
+                                        none_policy="ignore", force_reprocess=args.force_data_prep)
         dataset = filter_labels(dataset, remove_labels=["sprint", "jumps"])
         train_idx, val_idx = split_by_subject(dataset, val_ratio=0.2)
         num_classes = len(dataset.label_map)
