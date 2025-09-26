@@ -90,23 +90,23 @@ class TransformerLayer(nn.Module):
         self.self_attn = MultiheadSelfAttention(d_model, nhead, dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.mlp = nn.Sequential(
-            nn.LayerNorm(d_model),
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(dim_feedforward, d_model),
-            nn.Dropout(dropout),
         )
 
     def forward(self, x: torch.Tensor, x_mask: torch.Tensor = None):
         # Self-attention
-        x_tmp = self.self_attn(self.norm1(x), mask=x_mask)
-        x = x_tmp + self.dropout(x)
+        attn_out = self.self_attn(x, mask=x_mask)
+        x = self.norm1(x + self.dropout1(attn_out))
 
-        # Feedforward
-        x = x + self.mlp(x)
+        # Feed-forward with residual connection
+        ffn_out = self.ffn(x)
+        x = self.norm2(x + self.dropout2(ffn_out))
         return x
 
 

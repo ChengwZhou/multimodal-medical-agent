@@ -32,6 +32,8 @@ import time
 import argparse
 from models.former import build_former
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
+from utils.metrics import compute_metrics, print_metrics
+
 
 
 logging.basicConfig(level=logging.INFO)
@@ -226,7 +228,7 @@ class SequentialTrainer:
             shuffle=(train_sampler is None),
             sampler=train_sampler,
             collate_fn=collate_sequential_batch,
-            num_workers=4,
+            num_workers=1,
             pin_memory=True,
             persistent_workers=True
         )
@@ -238,7 +240,7 @@ class SequentialTrainer:
                 shuffle=False,
                 sampler=val_sampler,
                 collate_fn=collate_sequential_batch,
-                num_workers=4,
+                num_workers=1,
                 pin_memory=True,
                 persistent_workers=True
             )
@@ -253,7 +255,9 @@ class SequentialTrainer:
         self.best_val_acc = 0.0
 
         # Loss function
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        weights = torch.tensor([14.303363800048828, 13.314342498779297, 30.003421783447266, 30.785348892211914, 0.17281104624271393, 13.78414249420166, 2.526700496673584])
+        weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
+        self.criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=-100)
 
         if self.is_main_process:
             log_info(f"Trainer initialized - Device: {self.device}")

@@ -39,6 +39,7 @@ from sequential_trainer import (
 from models.sensor_gating_agent import SensorGatingAgent
 from models.former import build_former
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
+from utils.metrics import compute_metrics, print_metrics
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -149,7 +150,7 @@ class AgentSequentialTrainer:
             shuffle=(train_sampler is None),
             sampler=train_sampler,
             collate_fn=collate_sequential_batch,
-            num_workers=4,
+            num_workers=1,
             pin_memory=True,
             persistent_workers=True
         )
@@ -161,7 +162,7 @@ class AgentSequentialTrainer:
                 shuffle=False,
                 sampler=val_sampler,
                 collate_fn=collate_sequential_batch,
-                num_workers=4,
+                num_workers=1,
                 pin_memory=True,
                 persistent_workers=True
             )
@@ -176,7 +177,9 @@ class AgentSequentialTrainer:
         self.best_val_acc = 0.0
 
         # Loss function
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        weights = torch.tensor([14.303363800048828, 13.314342498779297, 30.003421783447266, 30.785348892211914, 0.17281104624271393, 13.78414249420166, 2.526700496673584])
+        weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
+        self.criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=-100)
 
         if self.is_main_process:
             log_info(f"AgentSequentialTrainer initialized - Device: {self.device}")
@@ -217,7 +220,7 @@ class AgentSequentialTrainer:
         seq_lengths = batch.seq_lengths.to(self.device)  # [B]
 
         B, max_seq_len, C, T = sequences.shape
-        M = self.agent.num_modalities
+        M = self.agent.module.num_modalities if self.is_ddp else self.agent.num_modalities
 
         # Initialize tracking variables
         total_ce_loss = 0.0
@@ -229,7 +232,8 @@ class AgentSequentialTrainer:
 
         # Initialize memory and sensor history
         mem = None
-        sensor_history = torch.ones(B, self.agent.history_length, M).to(self.device)  # Start with all sensors on
+        history_length = self.agent.module.history_length if self.is_ddp else self.agent.history_length
+        sensor_history = torch.ones(B, history_length, M).to(self.device)  # Start with all sensors on
 
         # Process sequences in chunks of bptt_steps
         num_chunks = (max_seq_len + self.bptt_steps - 1) // self.bptt_steps
@@ -295,6 +299,7 @@ class AgentSequentialTrainer:
                 else:
                     # First window or no memory yet - use all sensors
                     window_masked = window
+                    p_st = None
                     p_soft = None
 
                 # Forward through model
@@ -324,7 +329,7 @@ class AgentSequentialTrainer:
                         chunk_gating_loss += gating_loss
 
                         with torch.no_grad():
-                            total_sensor_usage += p_soft.mean().item()
+                            total_sensor_usage += p_st.detach().mean().item()
 
             # Backward pass for this chunk
             if chunk_samples > 0:
@@ -400,14 +405,18 @@ class AgentSequentialTrainer:
         total_sensor_usage = 0.0
         sensor_usage_counts = 0
 
+        all_preds = []
+        all_labels = []
+
         for batch in tqdm(self.val_loader, desc="Validation", leave=False, disable=not self.is_main_process):
             sequences = batch.sequences.to(self.device)
             labels = batch.labels.to(self.device)
             B, max_seq_len, C, T = sequences.shape
-            M = self.agent.num_modalities
+            M = self.agent.module.num_modalities if self.is_ddp else self.agent.num_modalities
 
             mem = None
-            sensor_history = torch.ones(B, self.agent.history_length, M).to(self.device)
+            history_length = self.agent.module.history_length if self.is_ddp else self.agent.history_length
+            sensor_history = torch.ones(B, history_length, M).to(self.device)
 
             for i in range(max_seq_len):
                 window = sequences[:, i, :, :]
@@ -460,6 +469,13 @@ class AgentSequentialTrainer:
                         correct_count += correct
                         total_samples += batch_size
 
+                        all_preds.append(preds.cpu())
+                        all_labels.append(label[mask].cpu())
+                        # print(preds.shape, label[mask].shape)
+
+        all_preds = torch.cat(all_preds)
+        all_labels = torch.cat(all_labels)
+
         # Synchronize across processes if DDP
         if self.is_ddp:
             metrics_tensor = torch.tensor(
@@ -469,8 +485,18 @@ class AgentSequentialTrainer:
             dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
             total_ce_loss, correct_count, total_samples, total_sensor_usage, sensor_usage_counts = metrics_tensor.tolist()
 
+            all_preds_list = [torch.zeros_like(all_preds) for _ in range(self.world_size)]
+            all_labels_list = [torch.zeros_like(all_labels) for _ in range(self.world_size)]
+            torch.distributed.all_gather(all_preds_list, all_preds.to(self.device))
+            torch.distributed.all_gather(all_labels_list, all_labels.to(self.device))
+            all_preds = torch.cat(all_preds_list).numpy()
+            all_labels = torch.cat(all_labels_list).numpy()
+
         if total_samples == 0:
             return {"val_loss": 0.0, "val_accuracy": 0.0, "val_sensor_usage": 1.0}
+
+        metrics = compute_metrics(all_labels, all_preds, average='macro')
+        print_metrics(metrics)
 
         avg_loss = total_ce_loss / total_samples
         avg_accuracy = correct_count / total_samples
@@ -671,6 +697,8 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--bptt_steps', type=int, default=10)
     parser.add_argument('--num_epochs', type=int, default=10)
+    parser.add_argument('--window_sec', type=float, default=1.0)
+    parser.add_argument('--stride_sec', type=float, default=10)
     parser.add_argument('--ce_weight', type=float, default=1.0)
     parser.add_argument('--gating_weight', type=float, default=0.1)
     parser.add_argument('--root', type=str,
@@ -685,8 +713,9 @@ if __name__ == "__main__":
     # build dataset and model (each process will run this; that's fine)
     data_root = args.root
 
-    dataset = ScientISSTMOVEDataset(root=data_root, window_sec=1, stride_sec=10, none_policy="ignore")
+    dataset = ScientISSTMOVEDataset(root=data_root, window_sec=args.window_sec, stride_sec=args.stride_sec, none_policy="ignore")
     dataset = filter_labels(dataset, remove_labels=["sprint", "jumps"])
+    print(dataset.label_map)
     train_subjects = dataset.subjects[:int(0.8 * len(dataset.subjects))]
     val_subjects = dataset.subjects[int(0.8 * len(dataset.subjects)):]
 
@@ -715,7 +744,8 @@ if __name__ == "__main__":
             "gating_weight": args.gating_weight,
             "learning_rate": 1e-3,
             "use_amp": True,
-            "grad_clip_norm": 1.0
+            "grad_clip_norm": 1.0,
+            "val_interval": 1
         },
         ddp_config=ddp_config
     )

@@ -56,7 +56,7 @@ class SensorGatingAgent(nn.Module):
         #     dropout=0.1
         # )
         #
-        # # decision heads (保留)
+        # # decision heads (Reserved)
         # self.decision_heads = nn.ModuleList([
         #     nn.Sequential(
         #         nn.Linear(hidden_dim, hidden_dim // 2),
@@ -159,7 +159,7 @@ class SensorGatingAgent(nn.Module):
 
     def _compute_state_duration(self, sensor_history: torch.Tensor) -> torch.Tensor:
         """
-        计算每个模态当前状态持续segment数量（可选，若需要）
+        Calculate the number of segments for which each modality's current state persists (optional, if needed)
         sensor_history: [B, T, M]
         """
         B, T, M = sensor_history.shape
@@ -175,7 +175,7 @@ class SensorGatingAgent(nn.Module):
 
     def compute_trigger_penalty(self, state_changes: torch.Tensor, segments_per_hour: float = 3600.0) -> torch.Tensor:
         """
-        触发成本 proxy: state_changes * (segments_per_hour / 1.0)
+        Trigger Cost Proxy: Number of state changes * (Number of hourly segments / 1.0)
         state_changes: [B] or scalar
         """
         return state_changes * (segments_per_hour / 1.0)
@@ -192,17 +192,17 @@ class SensorGatingAgent(nn.Module):
                          segments_per_hour: float = 3600.0,
                          fn_cap: Optional[float] = None) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        计算联合损失：
+        Calculate the jointed loss:
         - p_soft: [B, M] continuous gating probabilities
         - masked_task_logits: [B, C] logits produced by backbone with gating applied (this is what you'd actually use to compute task loss)
         - full_task_logits: [B, C] logits produced by backbone with all sensors on (baseline)
         - labels: [B] class labels for task
         Returns:
             total_loss, diagnostics
-        说明：
-            - masked_task_loss: 真实被优化的任务 loss (cross entropy on masked logits)
-            - soft_FN_proxy: ReLU(masked_loss - full_loss) (continuous) -> 反应由于 gating 导致的性能下降
-            - energy ≈ mean(p_soft) (per-sample averaged)
+        Note:
+            - masked_task_loss: The actual task loss being optimized (cross-entropy on masked logits)
+            - soft_FN_proxy: ReLU(masked_loss - full_loss) (continuous) → Reflects performance degradation caused by the gating mechanism
+            - energy ≈ mean(p_soft) (averaged per sample)
         """
         B = p_soft.shape[0]
         device = p_soft.device
