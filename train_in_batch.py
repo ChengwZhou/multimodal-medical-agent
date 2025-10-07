@@ -14,9 +14,9 @@ from models.cnn_res_v2 import CNN1DResidualV2
 from models.former import build_former
 
 from utils.mHEALTH_loader import MHealthDataset
-from utils.ScientISST_MOVE_loader import MoveEDFWindowDataset, split_by_subject, filter_labels
-from utils.WESAD_loader import MultiModalWESADDataset, wesad_split_by_subject
-from utils.IMU_loader import IMUDataset, IMUFeatureDataset
+from utils.ScientISST_MOVE_loader import split_by_subject, filter_labels
+from dataset.WESAD_loader import MultiModalWESADDataset, wesad_split_by_subject
+from dataset.IMU_loader import IMUDataset
 
 from utils.metrics import compute_metrics, print_metrics
 
