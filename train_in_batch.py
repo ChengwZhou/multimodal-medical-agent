@@ -12,8 +12,12 @@ from torch.utils.data import DataLoader, Subset, DistributedSampler
 
 from models.cnn_res_v2 import CNN1DResidualV2
 from models.former import build_former
-from dataset.mHEALTH_loader import MHealthDataset
-from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, split_by_subject, filter_labels
+
+from utils.mHEALTH_loader import MHealthDataset
+from utils.ScientISST_MOVE_loader import MoveEDFWindowDataset, split_by_subject, filter_labels
+from utils.WESAD_loader import MultiModalWESADDataset, wesad_split_by_subject
+from utils.IMU_loader import IMUDataset, IMUFeatureDataset
+
 from utils.metrics import compute_metrics, print_metrics
 
 
@@ -192,7 +196,7 @@ def eval_epoch(model, loader, device, criterion, epoch, rank, world_size):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', required=True)
-    parser.add_argument('--dataset', type=str, default='siscientisst')
+    parser.add_argument('--dataset', type=str, default='wesad')
     parser.add_argument('--window_sec', type=float, default=1.0)
     parser.add_argument('--stride_sec', type=float, default=0.5)
     parser.add_argument('--epochs', type=int, default=30)
@@ -244,7 +248,7 @@ def main():
         # model = CNN1DResidualV2(num_modal=14, num_classes=num_classes)
         model = build_former(num_modal=14, num_classes=num_classes, model_dim=32)
 
-    else:
+    elif args.dataset == 'mhealth':
         train_subset = MHealthDataset(args.data_root, subjects=[i for i in range(1, 9)], time_steps=100, step=50, balance=False, majority_n=500)  # 50 Hz
         val_subset = MHealthDataset(args.data_root, subjects=[9, 10], time_steps=100, step=50, balance=False, majority_n=120)
         train_sampler = DistributedSampler(train_subset, num_replicas=world_size, rank=rank,
@@ -262,9 +266,103 @@ def main():
         # model = CNNLSTM(input_dim=12, num_classes=num_classes)
         model = CNN1DResidualV2(num_modal=12, num_classes=num_classes)
 
+    elif args.dataset == 'wesad':
+        dataset = MultiModalWESADDataset(
+            root=args.data_root,
+        )
+
+        train_idx, val_idx = wesad_split_by_subject(dataset, val_ratio=0.1)
+        num_classes = len(dataset.label_map)
+
+        train_subset = Subset(dataset, train_idx)
+        val_subset = Subset(dataset, val_idx)
+
+        train_sampler = DistributedSampler(
+            train_subset, num_replicas=world_size, rank=rank, shuffle=True
+        ) if world_size > 1 else None
+        val_sampler = DistributedSampler(
+            val_subset, num_replicas=world_size, rank=rank, shuffle=False
+        ) if world_size > 1 else None
+
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            shuffle=(train_sampler is None),
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=simple_collate,
+            drop_last=False
+        )
+        val_loader = DataLoader(
+            val_subset,
+            batch_size=args.batch_size,
+            sampler=val_sampler,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=simple_collate,
+            drop_last=False
+        )
+
+    elif args.dataset == 'imu':
+        train_subjects = ['15','16','17','18','20']
+        test_subjects  = ['22','23']
+
+        train_dataset = IMUDataset(root=args.data_root, subject_numbers=train_subjects, pert_window=8000)
+        val_dataset   = IMUDataset(root=args.data_root, subject_numbers=test_subjects, pert_window=8000, label_encoder=train_dataset.le)
+        #train_dataset = IMUFeatureDataset(root=args.data_root, subject_numbers=train_subjects)
+        #val_dataset   = IMUFeatureDataset(root=args.data_root, subject_numbers=test_subjects, label_encoder=train_dataset.le)
+
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True
+        ) if world_size > 1 else None
+
+        val_sampler = DistributedSampler(
+            val_dataset, num_replicas=world_size, rank=rank, shuffle=False
+        ) if world_size > 1 else None
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            shuffle=(train_sampler is None),
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=lambda batch: (
+                torch.stack([x for x, _ in batch], dim=0),
+                torch.tensor([y for _, y in batch], dtype=torch.long)
+            ),
+            drop_last=False
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            sampler=val_sampler,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=lambda batch: (
+                torch.stack([x for x, _ in batch], dim=0),
+                torch.tensor([y for _, y in batch], dtype=torch.long)
+            ),
+            drop_last=False
+        )
+
+        num_classes = len(train_dataset.le.classes_)
+
+        model = CNN1DResidualV2(num_modal=train_dataset.num_modal, num_classes=num_classes)
+
+    '''
+    if os.path.exists("./checkpoints/latest_ckp.pt"):
+        checkpoint = torch.load("./checkpoints/latest_ckp.pt", map_location="cpu")
+        model.load_state_dict(checkpoint["model"])
+    '''
     model.to(device)
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     lr_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -301,7 +399,7 @@ def main():
 
         # Save checkpoint
         if is_main(rank):
-            ckpt_path = os.path.join(args.save_dir, f"latest_ckp.pt")
+            ckpt_path = os.path.join(args.save_dir, f"imu_latest_ckp.pt")
             to_save = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
             torch.save({
                 'epoch': epoch,
