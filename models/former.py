@@ -56,10 +56,10 @@ class ModalityConfig:
 class MultimodalActivityTransformer(nn.Module):
     def __init__(self,
         num_classes: int,
-        model_dim: int = 256,
+        model_dim: int = 32,
         nhead: int = 8,
         fusion_depth: int = 4,
-        ff_dim: int = 1024,
+        ff_dim: int = 128,
         dropout: float = 0.1,
         modalities: Optional[List[ModalityConfig]] = None,
         use_modal_dropout: bool = True,

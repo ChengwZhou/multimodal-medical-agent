@@ -87,7 +87,7 @@ class SensorGatingAgent(nn.Module):
 
     def extract_modality_features(self, represent_features: torch.Tensor) -> torch.Tensor:
         """
-        从 represent_features 提取 per-modality 聚合特征并通过 gate_feature_extractor 得到 gate logits
+        Extract the aggregated features for each modality from represent_features, and obtain the gating logic values through gate_feature_extractor.
         returns gate_logits: [B, M]
         """
         B, seq_len, D = represent_features.shape

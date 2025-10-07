@@ -37,7 +37,7 @@ from sequential_trainer import (
 )
 
 from models.sensor_masking_agent import SensorGatingAgent
-from models.former import build_former
+from models.sigma_former import AdaptiveSensingMultimodalTransformer
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
 from utils.metrics import compute_metrics, print_metrics
 
@@ -304,7 +304,7 @@ class AgentSequentialTrainer:
 
                 # Forward through model
                 with autocast(enabled=self.use_amp):
-                    logits, mem = self.model(window_masked, mem if i > start_idx else None)
+                    logits, mem, info = self.model(window_masked, mem if i > start_idx else None)
 
                     # Store memory for BPTT (don't detach within chunk)
                     chunk_mems.append(mem)
@@ -719,7 +719,7 @@ if __name__ == "__main__":
     train_subjects = dataset.subjects[:int(0.8 * len(dataset.subjects))]
     val_subjects = dataset.subjects[int(0.8 * len(dataset.subjects)):]
 
-    model = build_former(num_modal=14, num_classes=len(dataset.label_map), model_dim=32, return_mem=True)
+    model = AdaptiveSensingMultimodalTransformer(num_classes=len(dataset.label_map), model_dim=32, return_mem=True, return_sensing_info=True)
     agent = SensorGatingAgent(num_modalities=14, feature_dim=32)
 
     # pass ddp config into trainer
