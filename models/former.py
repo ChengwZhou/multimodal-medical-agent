@@ -178,7 +178,7 @@ class MultimodalActivityTransformer(nn.Module):
             return logits
 
 
-def build_former(num_modal=14, num_classes=10, model_dim=32):
+def build_former(num_modal=14, num_classes=10, model_dim=32,  return_mem=False):
     # define 14 modalities with patch_size=10
     modalities = [ModalityConfig(f'm{i}', 1, 10) for i in range(num_modal)]
     return MultimodalActivityTransformer(
@@ -192,6 +192,7 @@ def build_former(num_modal=14, num_classes=10, model_dim=32):
         use_modal_dropout=True,
         modal_dropout_p=0.15,
         max_len=500,
+        return_mem= return_mem
     )
 
 

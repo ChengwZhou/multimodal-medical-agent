@@ -29,7 +29,6 @@ except Exception as e:
 from utils.filters import apply_filter, resample_to, zscore
 
 
-# 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -155,7 +154,7 @@ class ProcessedWindow:
 # Optimized Dataset
 # -----------------------------
 
-class MoveEDFWindowDataset(Dataset):
+class ScientISSTMOVEDataset(Dataset):
     def __init__(
             self,
             root: str,
@@ -603,7 +602,7 @@ class MoveEDFWindowDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         """Fast access to pre-processed and integrated data"""
         window = self.processed_windows[idx]
-        y = -1 if window.y is None else int(window.y)
+        y = -100 if window.y is None else int(window.y)
         return window.x_tensor, y  # [C=14, T], int
 
     def get_subject_sequence(self, subject_id: str) -> List[Tuple[torch.Tensor, int]]:
@@ -614,7 +613,7 @@ class MoveEDFWindowDataset(Dataset):
         sequence = []
         for window_idx in self.subject_to_windows[subject_id]:
             window = self.processed_windows[window_idx]
-            y = -1 if window.y is None else int(window.y)
+            y = -100 if window.y is None else int(window.y)
             sequence.append((window.x_tensor, y))
 
         return sequence
@@ -624,7 +623,7 @@ class MoveEDFWindowDataset(Dataset):
 # Utility functions (unchanged)
 # -----------------------------
 
-def split_by_subject(dataset: MoveEDFWindowDataset, val_ratio: float = 0.2):
+def split_by_subject(dataset: ScientISSTMOVEDataset, val_ratio: float = 0.2):
     rng = np.random.default_rng(42)
     sub_ids = dataset.subjects
     n_val = max(1, int(round(len(sub_ids) * val_ratio)))
@@ -640,7 +639,7 @@ def split_by_subject(dataset: MoveEDFWindowDataset, val_ratio: float = 0.2):
     return train_idx, val_idx
 
 
-def filter_labels(dataset: MoveEDFWindowDataset, remove_labels):
+def filter_labels(dataset: ScientISSTMOVEDataset, remove_labels):
     """Remove specified labels and update the dataset"""
     remove_set = set(remove_labels)
     to_remove = [lbl for lbl in dataset.label_map if lbl in remove_set]

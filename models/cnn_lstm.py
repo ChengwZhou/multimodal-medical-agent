@@ -4,9 +4,9 @@ import torch.nn as nn
 class CNNLSTM(nn.Module):
     def __init__(self, input_dim=12, hidden_dim=64, lstm_layers=1, num_classes=13):
         """
-        input_dim: 每个时间步的特征数量
+        input_dim: Number of features per time step
         hidden_dim: LSTM hidden size
-        num_classes: 分类类别数 (mHealth 有 13 类活动)
+        num_classes: Number of classification categories (mHealth has 13 activity classes)
         """
         super().__init__()
         self.conv1 = nn.Conv1d(input_dim, 32, kernel_size=3, padding=1)
