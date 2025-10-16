@@ -245,7 +245,7 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
         self.return_mem = return_mem
         self.return_sensing_info = return_sensing_info
 
-        # Adaptive sensing modules for each modality
+        # Adaptive sensing fairseq_signals_modules for each modality
         self.adaptive_sensing = nn.ModuleDict()
         for m in modalities:
             self.adaptive_sensing[m.name] = AdaptiveSensingModule(
