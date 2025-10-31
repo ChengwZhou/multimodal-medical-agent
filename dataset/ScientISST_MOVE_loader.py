@@ -21,6 +21,8 @@ import torch
 from torch.utils.data import Dataset
 from torch.distributed import get_rank, is_initialized
 
+from dataset.delta_dataset import DeltaDataset
+
 try:
     import pyedflib
 except Exception as e:
@@ -358,10 +360,10 @@ class ScientISSTMOVEDataset(Dataset):
             ('ecg_chest_gel', chest_signals.get('ecg_gel', np.zeros(100))),
             ('ecg_chest_textile', chest_signals.get('ecg_textile', np.zeros(100))),
             ('eda_forearm_scientisst', fore_signals.get('eda', np.zeros(100))),
-            ('eda_wrist_e4', wrist_signals.get('eda', np.zeros(100))),
             ('ppg_forearm_scientisst', fore_signals.get('ppg', np.zeros(100))),
-            ('ppg_wrist_e4', wrist_signals.get('ppg', np.zeros(100))),
             ('emg_forearm', fore_signals.get('emg', np.zeros(100))),
+            ('eda_wrist_e4', wrist_signals.get('eda', np.zeros(100))),
+            ('ppg_wrist_e4', wrist_signals.get('ppg', np.zeros(100))),
             ('temp_wrist', wrist_signals.get('temp', np.zeros(100))),
         ]
 
@@ -394,7 +396,7 @@ class ScientISSTMOVEDataset(Dataset):
         w_chs = [ch.unsqueeze(0) if ch.dim() == 1 else ch for ch in w_chs]  # Ensure [1, T]
 
         # Concatenate all parts: 8 single + 3 chest_acc + 3 wrist_acc = 14 channels
-        all_parts = parts + c_chs + w_chs
+        all_parts = c_chs + parts + w_chs
         x_integrated = torch.cat(all_parts, dim=0)  # [14, T]
 
         return x_integrated
@@ -430,13 +432,14 @@ class ScientISSTMOVEDataset(Dataset):
                         if acc_label:
                             acc_data.append(self._slice_and_process_signal(wrist, acc_label, t0, dur, 100, "acc"))
                         else:
-                            acc_data.append(np.zeros(100, dtype=np.float32))
+                            acc_data.append(np.zeros(int(round(self.window_sec * 100)), dtype=np.float32))
                     wrist_signals['w_acc'] = np.stack(acc_data, axis=0)  # [3, 100]
             else:
+                target_len = int(round(self.window_sec * 100))
                 if key == 'w_acc':
-                    wrist_signals[key] = np.zeros((3, 100), dtype=np.float32)
+                    wrist_signals[key] = np.zeros((3, target_len), dtype=np.float32)
                 else:
-                    wrist_signals[key] = np.zeros(100, dtype=np.float32)
+                    wrist_signals[key] = np.zeros(target_len, dtype=np.float32)
 
         # Process chest signals
         chest_signals = {}
@@ -453,13 +456,13 @@ class ScientISSTMOVEDataset(Dataset):
                         if acc_label:
                             acc_data.append(self._slice_and_process_signal(chest, acc_label, t0, dur, 100, "acc"))
                         else:
-                            acc_data.append(np.zeros(100, dtype=np.float32))
+                            acc_data.append(np.zeros(int(round(self.window_sec * 100)), dtype=np.float32))
                     chest_signals['c_acc'] = np.stack(acc_data, axis=0)  # [3, 100]
             else:
                 if key == 'c_acc':
-                    chest_signals[key] = np.zeros((3, 100), dtype=np.float32)
+                    chest_signals[key] = np.zeros((3, int(round(self.window_sec * 100))), dtype=np.float32)
                 else:
-                    chest_signals[key] = np.zeros(100, dtype=np.float32)
+                    chest_signals[key] = np.zeros(int(round(self.window_sec * 100)), dtype=np.float32)
 
         # Process forearm signals
         fore_signals = {}
@@ -473,7 +476,7 @@ class ScientISSTMOVEDataset(Dataset):
                 elif key == 'ppg':
                     fore_signals[key] = self._slice_and_process_signal(fore, matched_label, t0, dur, 100, "ppg")
             else:
-                fore_signals[key] = np.zeros(100, dtype=np.float32)
+                fore_signals[key] = np.zeros(int(round(self.window_sec * 100)), dtype=np.float32)
 
         # Integrate all signals into single tensor
         x_tensor = self._integrate_signals_to_tensor(wrist_signals, chest_signals, fore_signals)
@@ -684,3 +687,183 @@ def filter_labels(dataset: ScientISSTMOVEDataset, remove_labels):
     dataset.subject_to_windows = new_subject_to_windows
 
     return dataset
+
+# ... (Previous content of ScientISST_MOVE_loader.py remains unchanged up to the test code section)
+
+# -----------------------------
+# Test code
+# -----------------------------
+
+if __name__ == "__main__":
+    import time
+    import numpy as np
+    from dataset.delta_dataset import DeltaDataset  # Import DeltaDataset
+
+    # Test configuration
+    data_root = "/Users/chengweizhou/PycharmProjects/data/scientisst-move-annotated-wearable-multimodal-biosignals-recorded-during-everyday-life-activities-in-naturalistic-environments-1.0.1"
+
+    print("=" * 60)
+    print("Testing ScientISST MOVE Dataset with Differencing")
+    print("=" * 60)
+
+    try:
+        # Initialize dataset
+        print("Initializing dataset...")
+        start_time = time.time()
+
+        base_dataset = ScientISSTMOVEDataset(
+            root=data_root,
+            window_sec=1,
+            stride_sec=10,
+            min_coverage=0.95,
+            none_policy="extra_class",
+            norm_mode='dataset',
+            force_reprocess=True  # Force reprocessing
+        )
+        dataset = DeltaDataset(base_dataset, axis=-1)  # Wrap with DeltaDataset for differencing
+
+        init_time = time.time() - start_time
+        print(f"Dataset initialization took: {init_time:.2f} seconds")
+        print()
+
+        # Basic dataset info
+        print("Dataset Information:")
+        print(f"  Total samples: {len(dataset)}")
+        print(f"  Number of subjects: {len(dataset.subjects)}")
+        print(f"  Subjects: {dataset.subjects[:5]}{'...' if len(dataset.subjects) > 5 else ''}")
+        print(f"  Label mapping: {dataset.label_map}")
+        print()
+
+        # Test data loading
+        print("Testing data loading...")
+        sample_indices = [0, len(dataset) // 4, len(dataset) // 2, len(dataset) - 1]
+
+        for i, idx in enumerate(sample_indices):
+            if idx < len(dataset):
+                x, y = dataset[idx]
+                window = dataset.processed_windows[idx]  # Access via base_dataset through __getattr__
+                print(f"Sample {i + 1} (index {idx}):")
+                print(f"  Subject: {window.subject_id}")
+                print(f"  Tensor shape: {x.shape}")
+                print(f"  Label: {y}")
+                print(f"  Tensor dtype: {x.dtype}")
+                print(f"  Tensor range: [{x.min():.4f}, {x.max():.4f}]")
+
+                # Check differencing - first few values of first channel
+                first_channel = x[0, :10].numpy()
+                print(f"  First 10 values of channel 0: {first_channel}")
+
+                # Test differencing logic with a simple example
+                if i == 0:  # Only for first sample
+                    print("  Testing differencing logic:")
+                    test_signal = np.array([1.0, 1.0, 1.0, 2.0, 2.0, 3.0])
+                    diff_result = dataset.apply_differencing(test_signal)  # Use DeltaDataset's method
+                    print(f"    Original: {test_signal}")
+                    print(f"    Differenced: {diff_result}")
+                    expected = np.array([1.0, 0.0, 0.0, 1.0, 0.0, 1.0])
+                    print(f"    Expected: {expected}")
+                    print(f"    Match: {np.allclose(diff_result, expected)}")
+
+                # Verify differencing property (for constant signals)
+                if np.allclose(first_channel[1:], 0.0, atol=1e-6):
+                    print(f"  ✓ Constant signal correctly differenced (differences are ~0)")
+                else:
+                    # Check if differencing property holds for non-constant signals
+                    differences = first_channel[1:]
+                    reconstructed_diffs = np.diff(x[0, :len(differences) + 1].numpy())
+                    if len(reconstructed_diffs) > 0 and np.allclose(differences, reconstructed_diffs, atol=1e-5):
+                        print(f"  ✓ Differencing property verified")
+                    else:
+                        print(f"  ⚠ Differencing property check inconclusive")
+                print()
+
+        # Test subject sequence
+        if dataset.subjects:
+            test_subject = dataset.subjects[0]
+            sequence = dataset.get_subject_sequence(test_subject)
+            print(f"Subject '{test_subject}' sequence:")
+            print(f"  Number of windows: {len(sequence)}")
+            if sequence:
+                x_seq, y_seq = sequence[0]
+                print(f"  First window shape: {x_seq.shape}")
+                print(f"  First window label: {y_seq}")
+            print()
+
+        # Test train/validation split
+        print("Testing train/validation split...")
+        train_idx, val_idx = split_by_subject(dataset, val_ratio=0.2)
+        print(f"  Training samples: {len(train_idx)}")
+        print(f"  Validation samples: {len(val_idx)}")
+        print(f"  Split ratio: {len(val_idx) / (len(train_idx) + len(val_idx)):.3f}")
+        print()
+
+        # Test label filtering
+        print("Testing label filtering...")
+        original_labels = set(dataset.label_map.keys())
+        print(f"  Original labels: {original_labels}")
+
+        # Create a copy for testing filtering
+        try:
+            import copy
+
+            test_base_dataset = copy.deepcopy(base_dataset)  # Copy the base dataset
+            test_dataset = DeltaDataset(test_base_dataset, axis=-1)  # Wrap the copy
+
+            # Remove a label if available (e.g., remove 'lift' if it exists)
+            labels_to_remove = []
+            for label in ['lift', 'walk_before', '__none__']:
+                if label in test_dataset.label_map:
+                    labels_to_remove.append(label)
+                    break
+
+            if labels_to_remove:
+                filtered_dataset = filter_labels(test_dataset, labels_to_remove)
+                if filtered_dataset is not None:
+                    print(f"  Removed labels: {labels_to_remove}")
+                    print(f"  Remaining labels: {set(filtered_dataset.label_map.keys())}")
+                    print(f"  Samples after filtering: {len(filtered_dataset)}")
+                else:
+                    print(f"  Label filtering returned None")
+            else:
+                print("  No suitable labels found for filtering test")
+        except Exception as e:
+            print(f"  Label filtering test failed: {e}")
+        print()
+
+        # Performance test
+        print("Performance test (100 random samples)...")
+        import random
+
+        random_indices = random.sample(range(len(dataset)), min(100, len(dataset)))
+
+        start_time = time.time()
+        for idx in random_indices:
+            x, y = dataset[idx]
+        load_time = time.time() - start_time
+
+        print(f"  Loading 100 samples took: {load_time:.4f} seconds")
+        print(f"  Average time per sample: {load_time / len(random_indices):.6f} seconds")
+        print()
+
+        # Channel statistics (if normalization is enabled)
+        if hasattr(dataset, 'channel_mean') and hasattr(dataset, 'channel_std'):
+            print("Channel-wise statistics:")
+            print(f"  Mean shape: {dataset.channel_mean.shape}")
+            print(f"  Std shape: {dataset.channel_std.shape}")
+            print(f"  Mean range: [{dataset.channel_mean.min():.4f}, {dataset.channel_mean.max():.4f}]")
+            print(f"  Std range: [{dataset.channel_std.min():.4f}, {dataset.channel_std.max():.4f}]")
+            print()
+
+        print("=" * 60)
+        print("All tests completed successfully!")
+        print("=" * 60)
+
+    except FileNotFoundError as e:
+        print(f"Error: Data directory not found - {e}")
+        print("Please check the data path and make sure the dataset is available.")
+
+    except Exception as e:
+        print(f"Error during testing: {type(e).__name__}: {e}")
+        import traceback
+
+        traceback.print_exc()
