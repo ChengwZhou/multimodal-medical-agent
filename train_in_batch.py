@@ -10,15 +10,17 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset, DistributedSampler
 
-from models.cnn_res_v2 import CNN1DResidualV2
-from models.former import build_former
+from models.cnns.cnn_res_v2 import CNN1DResidualV2
+from models.former_device import build_former_device
+from models.FMformer import build_FMformer
 
-from utils.mHEALTH_loader import MHealthDataset
-from utils.ScientISST_MOVE_loader import split_by_subject, filter_labels
-from dataset.WESAD_loader import MultiModalWESADDataset, wesad_split_by_subject
+from dataset.mHEALTH_loader import MHealthDataset
+from dataset.ScientISST_MOVE_loader import split_by_subject, filter_labels, ScientISSTMOVEDataset
+# from dataset.WESAD_loader import MultiModalWESADDataset, wesad_split_by_subject
 from dataset.IMU_loader import IMUDataset
 
 from utils.metrics import compute_metrics, print_metrics
+from utils.modality_config import ModalityConfig
 
 
 # -----------------------
@@ -195,9 +197,11 @@ def eval_epoch(model, loader, device, criterion, epoch, rank, world_size):
 # -----------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_root', required=True)
-    parser.add_argument('--dataset', type=str, default='wesad')
-    parser.add_argument('--window_sec', type=float, default=1.0)
+    parser.add_argument('--dataset', type=str, default='siscientisst')
+    parser.add_argument('--data_root', type=str, default='/Users/chengweizhou/PycharmProjects/data/scientisst-move-annotated-wearable-multimodal-biosignals-recorded-during-everyday-life-activities-in-naturalistic-environments-1.0.1')
+
+    parser.add_argument('--model', type=str, default='FM_former')
+    parser.add_argument('--window_sec', type=float, default=1)
     parser.add_argument('--stride_sec', type=float, default=0.5)
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=32)
@@ -245,12 +249,20 @@ def main():
                                   num_workers=args.num_workers, pin_memory=True, collate_fn=simple_collate, drop_last=False)
         val_loader = DataLoader(val_subset, batch_size=args.batch_size, sampler=val_sampler, shuffle=False, num_workers=args.num_workers,
                                 pin_memory=True, collate_fn=simple_collate, drop_last=False)
-        # model = CNN1DResidualV2(num_modal=14, num_classes=num_classes)
-        model = build_former(num_modal=14, num_classes=num_classes, model_dim=32)
+
+        modalities = [
+            ModalityConfig('acc_c', 3, 10, 0), ModalityConfig('ecg_g_c', 1, 10, 0),
+            ModalityConfig('ecg_t_c', 1, 10, 0),
+            ModalityConfig('eda_f', 1, 10, 1), ModalityConfig('ppg_f', 1, 10, 1),
+            ModalityConfig('emg_f', 1, 10, 1),
+            ModalityConfig('eda_w', 1, 10, 2), ModalityConfig('ppg_w', 1, 10, 2),
+            ModalityConfig('temp_w', 1, 10, 2), ModalityConfig('acc_w', 3, 10, 2),
+        ]
+        num_modal = 14
 
     elif args.dataset == 'mhealth':
-        train_subset = MHealthDataset(args.data_root, subjects=[i for i in range(1, 9)], time_steps=100, step=50, balance=False, majority_n=500)  # 50 Hz
-        val_subset = MHealthDataset(args.data_root, subjects=[9, 10], time_steps=100, step=50, balance=False, majority_n=120)
+        train_subset = MHealthDataset(args.data_root, subjects=[i for i in range(1, 8)], time_steps=100, step=50, balance=False, majority_n=500)  # 50 Hz
+        val_subset = MHealthDataset(args.data_root, subjects=[8, 9, 10], time_steps=100, step=50, balance=False, majority_n=120)
         train_sampler = DistributedSampler(train_subset, num_replicas=world_size, rank=rank,
                                            shuffle=True) if world_size > 1 else None
         # val_sampler = DistributedSampler(val_subset, num_replicas=world_size, rank=rank,
@@ -263,47 +275,53 @@ def main():
         weights = torch.tensor([1,1,1,1,1,1,1,1,1,1,1,1])
         weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
 
-        # model = CNNLSTM(input_dim=12, num_classes=num_classes)
-        model = CNN1DResidualV2(num_modal=12, num_classes=num_classes)
+        # modalities = [
+        #     ModalityConfig('al', 3, 10, 0), ModalityConfig('gl', 3, 10, 0),
+        #     ModalityConfig('ar', 3, 10, 1), ModalityConfig('gr', 3, 10, 1),
+        # ]
+        modalities = [
+            ModalityConfig(f'm{i}', 1, 10, 0) for i in range(12)
+        ]
+        num_modal = 12
 
-    elif args.dataset == 'wesad':
-        dataset = MultiModalWESADDataset(
-            root=args.data_root,
-        )
-
-        train_idx, val_idx = wesad_split_by_subject(dataset, val_ratio=0.1)
-        num_classes = len(dataset.label_map)
-
-        train_subset = Subset(dataset, train_idx)
-        val_subset = Subset(dataset, val_idx)
-
-        train_sampler = DistributedSampler(
-            train_subset, num_replicas=world_size, rank=rank, shuffle=True
-        ) if world_size > 1 else None
-        val_sampler = DistributedSampler(
-            val_subset, num_replicas=world_size, rank=rank, shuffle=False
-        ) if world_size > 1 else None
-
-        train_loader = DataLoader(
-            train_subset,
-            batch_size=args.batch_size,
-            sampler=train_sampler,
-            shuffle=(train_sampler is None),
-            num_workers=args.num_workers,
-            pin_memory=True,
-            collate_fn=simple_collate,
-            drop_last=False
-        )
-        val_loader = DataLoader(
-            val_subset,
-            batch_size=args.batch_size,
-            sampler=val_sampler,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            collate_fn=simple_collate,
-            drop_last=False
-        )
+    # elif args.dataset == 'wesad':
+    #     dataset = MultiModalWESADDataset(
+    #         root=args.data_root,
+    #     )
+    #
+    #     train_idx, val_idx = wesad_split_by_subject(dataset, val_ratio=0.1)
+    #     num_classes = len(dataset.label_map)
+    #
+    #     train_subset = Subset(dataset, train_idx)
+    #     val_subset = Subset(dataset, val_idx)
+    #
+    #     train_sampler = DistributedSampler(
+    #         train_subset, num_replicas=world_size, rank=rank, shuffle=True
+    #     ) if world_size > 1 else None
+    #     val_sampler = DistributedSampler(
+    #         val_subset, num_replicas=world_size, rank=rank, shuffle=False
+    #     ) if world_size > 1 else None
+    #
+    #     train_loader = DataLoader(
+    #         train_subset,
+    #         batch_size=args.batch_size,
+    #         sampler=train_sampler,
+    #         shuffle=(train_sampler is None),
+    #         num_workers=args.num_workers,
+    #         pin_memory=True,
+    #         collate_fn=simple_collate,
+    #         drop_last=False
+    #     )
+    #     val_loader = DataLoader(
+    #         val_subset,
+    #         batch_size=args.batch_size,
+    #         sampler=val_sampler,
+    #         shuffle=False,
+    #         num_workers=args.num_workers,
+    #         pin_memory=True,
+    #         collate_fn=simple_collate,
+    #         drop_last=False
+    #     )
 
     elif args.dataset == 'imu':
         train_subjects = ['15','16','17','18','20']
@@ -351,8 +369,17 @@ def main():
         )
 
         num_classes = len(train_dataset.le.classes_)
+        modalities = None
+        num_modal = train_dataset.num_modal
 
-        model = CNN1DResidualV2(num_modal=train_dataset.num_modal, num_classes=num_classes)
+        # model = CNN1DResidualV2(num_modal=train_dataset.num_modal, num_classes=num_classes)
+
+    if args.model == "FM_former":
+        model = build_FMformer(num_classes=num_classes, model_dim=512, modalities=modalities)
+    elif args.model == "former":
+        model = build_former_device(num_classes=num_classes, model_dim=88*3*2, modalities=modalities)
+    else:
+        model = CNN1DResidualV2(num_modal=num_modal, num_classes=num_classes)
 
     '''
     if os.path.exists("./checkpoints/latest_ckp.pt"):

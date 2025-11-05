@@ -1,11 +1,13 @@
 import math
+import sys
+import os
 from typing import Dict, Optional, List, Tuple
-
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.transformer_utils import CrossAttentionLayer, TransformerLayer, TransformerBlock
+from models.transformer_utils import CrossAttentionLayer, TransformerLayer, TransformerBlock, CrossModalAttention
 
 
 # -----------------------------
@@ -74,50 +76,6 @@ class AdaptiveSensingModule(nn.Module):
             return int(torch.round(skip).item())
         else:
             return self.skip_steps
-
-    # def forward(self, delta_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    #     """
-    #     Apply adaptive sensing mask to delta input.
-    #
-    #     Args:
-    #         delta_input: [B, 1, T] - delta values: x0, x1-x0, x2-x1, ...
-    #
-    #     Returns:
-    #         masked_input: [B, 1, T] - delta input with masked positions set to 0
-    #         mask: [B, 1, T] - binary mask (1=active, 0=masked/sensor off)
-    #     """
-    #     B, C, T = delta_input.shape
-    #     assert C == 1, "Expected single channel input"
-    #
-    #     threshold = self.get_threshold()
-    #     skip_steps = self.get_skip_steps()
-    #
-    #     # Compute absolute delta values
-    #     abs_delta = torch.abs(delta_input)  # [B, 1, T]
-    #
-    #     # Initialize mask (all active initially)
-    #     mask = torch.ones_like(delta_input)  # [B, 1, T]
-    #
-    #     # Process each sample in batch
-    #     for b in range(B):
-    #         skip_until = 0  # Track when sensor can be turned on again
-    #
-    #         for t in range(T):
-    #             if t < skip_until:
-    #                 # Sensor is off due to previous skip
-    #                 mask[b, 0, t] = 0
-    #             else:
-    #                 # Check if current delta exceeds threshold
-    #                 if abs_delta[b, 0, t] < threshold:
-    #                     # Delta below threshold: turn off sensor for next skip_steps
-    #                     mask[b, 0, t] = 0
-    #                     skip_until = t + skip_steps
-    #                 # else: sensor stays on (mask already 1)
-    #
-    #     # Apply mask to input
-    #     masked_input = delta_input * mask
-    #
-    #     return masked_input, mask
 
     def forward(self, delta_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -217,7 +175,7 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
 
     def __init__(self,
                  num_classes: int,
-                 model_dim: int = 32,
+                 model_dim: int = 256,
                  nhead: int = 8,
                  fusion_depth: int = 4,
                  ff_dim: int = 128,
@@ -277,6 +235,12 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
             dropout=dropout
         )
 
+        # Cross-Modal attention
+        self.modal_cross_attn = CrossModalAttention(
+            model_dim, nhead,
+            dim_feedforward=ff_dim,
+            dropout=dropout
+        )
         # Fusion transformer
         self.fusion = TransformerBlock(
             TransformerLayer(
@@ -359,15 +323,16 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
         # Optional modal dropout
         per_mod_tokens = self._maybe_modal_dropout(per_mod_tokens)
 
-        # Concatenate tokens along time dimension
-        concat_tokens = torch.cat(per_mod_tokens, dim=1)  # [B, L_total, model_dim]
+        # modal cross attention
+        concat_tokens = self.modal_cross_attn(per_mod_tokens, kv_masks = history_mask)
+
 
         # Add positional encoding
         fused = self.positional(concat_tokens)
 
         # Cross-attention with history if provided
         if history is not None:
-            fused = self.cross_attn(fused, history, kv_mask=history_mask)
+            fused = self.cross_attn(fused, history)
 
         # Fusion transformer
         out = self.fusion(fused)
@@ -453,8 +418,9 @@ if __name__ == "__main__":
 
     x = torch.randn(8, 14, 100)  # [B, 14, T]
     history = torch.randn(8, 140, 32)  # [B, L_total, model_dim]
+    history_mask = torch.randn(8, 140, 32)  # [B, L_total, model_dim]
 
-    logits, mem, sensing_info = model_fixed(x, history=history)
+    logits, mem, sensing_info = model_fixed(x, history=history, history_mask=history_mask)
     print(f"  Logits shape: {logits.shape}")  # [8, 12]
     print(f"  Memory shape: {mem.shape}")  # [8, 140, 32]
     print(f"  Active ratios: {[f'{r:.2%}' for r in sensing_info['active_ratios'][:3]]}...")
@@ -471,7 +437,7 @@ if __name__ == "__main__":
         return_sensing_info=True
     )
 
-    logits, sensing_info = model_learnable(x, history=history)
+    logits, sensing_info = model_learnable(x, history=history, history_mask=history_mask)
     print(f"  Logits shape: {logits.shape}")
     print(f"  Active ratios: {[f'{r:.2%}' for r in sensing_info['active_ratios'][:3]]}...")
 

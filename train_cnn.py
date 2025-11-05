@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from models.cnn import CNN1DModel
+from models.cnns.cnn import CNN1DModel
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, split_by_subject
 from utils.metrics import compute_metrics, print_metrics
 

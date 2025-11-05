@@ -7,6 +7,10 @@ import torch.nn.functional as F
 import torch
 
 from models.transformer_utils import CrossAttentionLayer, TransformerLayer, TransformerBlock
+from models.FMs.ECG_FM import get_ecg_fm, ECG12LeadModelWithSingleLeadSupport
+from models.FMs.papgei_PPG_FM import ResNet1DMoE, load_checkpoint_to_model
+
+from utils.modality_config import ModalityConfig
 
 # -----------------------------
 # Utility Modules (as before)
@@ -46,13 +50,6 @@ class ConvTokenizer1D(nn.Module):
         return x                  # [B, L, out_ch]  (here out_ch==1)
 
 
-class ModalityConfig:
-    def __init__(self, name: str, in_ch: int, patch_size: int):
-        self.name = name
-        self.in_ch = in_ch
-        self.patch_size = patch_size
-
-
 class MultimodalActivityTransformer(nn.Module):
     def __init__(self,
         num_classes: int,
@@ -71,13 +68,11 @@ class MultimodalActivityTransformer(nn.Module):
 
         if modalities is None:
             modalities = [
-                ModalityConfig('m0', 1, 10), ModalityConfig('m1', 1, 10),
-                ModalityConfig('m2', 1, 10), ModalityConfig('m3', 1, 10),
-                ModalityConfig('m4', 1, 10), ModalityConfig('m5', 1, 10),
-                ModalityConfig('m6', 1, 10), ModalityConfig('m7', 1, 10),
-                ModalityConfig('m8', 1, 10), ModalityConfig('m9', 1, 10),
-                ModalityConfig('m10', 1, 10), ModalityConfig('m11', 1, 10),
-                ModalityConfig('m12', 1, 10), ModalityConfig('m13', 1, 10),
+                ModalityConfig('ecg_c_g', 1, 10), ModalityConfig('ecg_c_t', 1, 10),
+                ModalityConfig('eda_f', 1, 10), ModalityConfig('eda_w', 1, 10),
+                ModalityConfig('ppg_f', 1, 10), ModalityConfig('ppg_w', 1, 10),
+                ModalityConfig('emg_f', 1, 10), ModalityConfig('temp_w', 1, 10),
+                ModalityConfig('acc_c', 3, 10), ModalityConfig('acc_w', 3, 10),
             ]
 
         self.modalities = modalities
@@ -86,14 +81,63 @@ class MultimodalActivityTransformer(nn.Module):
         self.modal_dropout_p = modal_dropout_p
         self.return_mem = return_mem
 
-        # Tokenizers: each output 1 channel per patch (so final concat gives [B, 140, 1])
+        # Tokenizers: each output 1 channel per patch (so final concat gives [B, 140, 32])
         self.tokenizers = nn.ModuleDict()
         for m in modalities:
             # out_ch=1 so each patch becomes scalar feature
-            self.tokenizers[m.name] = ConvTokenizer1D(m.in_ch, out_ch=model_dim, patch_size=m.patch_size)
+            if m.name.startswith("ecg"):
+                # local_path = "/Users/chengweizhou/PycharmProjects/data/mimic_iv_ecg_finetuned.pt"
+                local_path = "fm_weights/mimic_iv_ecg_finetuned.pt"
+                ecg_12lead_model = get_ecg_fm(pretrained=True, local_path=local_path)
 
-        # After concatenation, we will project token scalar -> model_dim
-        # self.token_proj = nn.Linear(1, model_dim, bias=True)   # maps [B, L, 1] -> [B, L, model_dim]
+                # Wrap with single-lead support
+                model = ECG12LeadModelWithSingleLeadSupport(
+                    ecg_12lead_model=ecg_12lead_model,
+                    adaptation_method="zero_pad",
+                    lead_index=0  # LEAD I
+                )
+
+                self.tokenizers[m.name] = nn.Sequential(
+                    model,
+                    nn.Conv1d(in_channels=768, out_channels=32, kernel_size=1, stride=1, padding=0)
+                )
+                print(f"Foundation model loaded successfully for {m.name}")
+
+            elif m.name.startswith("ppg"):
+                model_config = {
+                    'base_filters': 32,
+                    'kernel_size': 3,
+                    'stride': 2,
+                    'groups': 1,
+                    'n_block': 18,
+                    'n_classes': 512,  # Embedding dimension
+                    'n_experts': 3
+                }
+
+                # Initialize Model
+                model = ResNet1DMoE(
+                    in_channels=1,
+                    base_filters=model_config['base_filters'],
+                    kernel_size=model_config['kernel_size'],
+                    stride=model_config['stride'],
+                    groups=model_config['groups'],
+                    n_block=model_config['n_block'],
+                    n_classes=model_config['n_classes'],
+                    n_experts=model_config['n_experts']
+                )
+
+                # local_path = "/Users/chengweizhou/PycharmProjects/data/papagei_s.pt"
+                local_path = "fm_weights/papagei_s.pt"
+                load_checkpoint_to_model(model, local_path, map_location="cpu")
+                self.tokenizers[m.name] = nn.Sequential(
+                    model,
+                    nn.Conv1d(in_channels=512, out_channels=32, kernel_size=1, stride=1, padding=0)
+                )
+                print(f"Foundation model loaded successfully for {m.name}")
+
+            else:
+                self.tokenizers[m.name] = ConvTokenizer1D(m.in_ch, out_ch=model_dim, patch_size=m.patch_size)
+                print(f"Tokenizer initialized successfully for {m.name}")
 
         # positional encoding for projected tokens (length max_len should >= 140)
         self.positional = PositionalEncoding(model_dim, max_len=max_len)
@@ -101,10 +145,6 @@ class MultimodalActivityTransformer(nn.Module):
         # CLS token for fusion
         self.cls_token = nn.Parameter(torch.zeros(1, 1, model_dim))
         nn.init.trunc_normal_(self.cls_token, std=0.02)
-
-        # History projection: history expected as [B, 1, 140] or [B, 140, 1]
-        # We will accept either shape, convert to [B, 140, 1] then project with this linear
-        self.history_proj = nn.Linear(1, model_dim, bias=True)  # maps per-token dim 1 -> model_dim
 
         # Cross-attention layers: fused (Q) attends to mem (K,V)
         self.cross_attn = CrossAttentionLayer(model_dim, nhead, dim_feedforward=ff_dim, dropout=dropout)
@@ -144,15 +184,26 @@ class MultimodalActivityTransformer(nn.Module):
 
         B = x.size(0)
         C = x.size(1)
-        assert C == len(self.modalities), f"expected {len(self.modalities)} channels, got {C}"
+        # assert C == sum(m.in_ch for m in self.modalities), f"expected {sum(m.in_ch for m in self.modalities)} channels, got {C}"
 
         per_mod_tokens = []
         # iterate channels and tokenize each (we created tokenizers per modality)
-        for i, m in enumerate(self.modalities):
-            # take channel i as shape [B, 1, T]
-            ch = x[:, i:i+1, :]                # [B, 1, T]
-            t = self.tokenizers[m.name](ch)    # [B, L=10, out_ch=1]
+        channel_index = 0
+        for m in self.modalities:
+            # take channel i as shape [B, in_ch, T]
+            ch = x[:, channel_index:channel_index + m.in_ch, :]                # [B, in_ch, T]
+            if m.name.startswith("ecg"):
+                new_len = int(ch.size(-1) * 1.6)
+                ch = F.interpolate(ch, size=new_len, mode='linear', align_corners=False)
+                t = self.tokenizers[m.name](ch).transpose(1, 2)    # [B, L=10, out_ch=1]
+            elif m.name.startswith("ppg"):
+                new_len = int(ch.size(-1) * 5)
+                ch = F.interpolate(ch, size=new_len, mode='linear', align_corners=False)
+                t = self.tokenizers[m.name](ch).transpose(1, 2)    # [B, L=10, out_ch=1]
+            else:
+                t = self.tokenizers[m.name](ch)    # [B, L=10, out_ch=1]
             per_mod_tokens.append(t)           # keep [B, 10, 1]
+            channel_index += m.in_ch
 
         # optional modal dropout
         per_mod_tokens = self._maybe_modal_dropout(per_mod_tokens)
@@ -178,9 +229,7 @@ class MultimodalActivityTransformer(nn.Module):
             return logits
 
 
-def build_former(num_modal=14, num_classes=10, model_dim=32,  return_mem=False):
-    # define 14 modalities with patch_size=10
-    modalities = [ModalityConfig(f'm{i}', 1, 10) for i in range(num_modal)]
+def build_FMformer(num_modal=14, num_classes=10, model_dim=32,  return_mem=False, modalities=None):
     return MultimodalActivityTransformer(
         num_classes=num_classes,
         model_dim=model_dim,
@@ -191,18 +240,18 @@ def build_former(num_modal=14, num_classes=10, model_dim=32,  return_mem=False):
         modalities=modalities,
         use_modal_dropout=True,
         modal_dropout_p=0.15,
-        max_len=500,
-        return_mem= return_mem
+        max_len=1400,
+        return_mem=return_mem
     )
 
 
 if __name__ == "__main__":
     # test run according to your spec
-    x = torch.randn(8, 14, 100)           # [B, 14, 100]
-    # history in the form [B, 1, 140]
-    history = torch.randn(8, 140, 32,)
-    model = build_former(num_classes=12, model_dim=32)
-    print(model)
+    x = torch.randn(8, 14, 1000)           # [B, 10, 100]
+    # history in the form [B, 1, 100] OR [B, 140, 1] (we handle both)
+    history = torch.randn(8, 100, 32,)
+    model = build_FMformer(num_classes=12, model_dim=32, return_mem=True)
+    # print(model)
     logits, aux = model(x, history=history)
     print("logits:", logits.shape)          # expected [8, 12]
     print("mem:", aux.shape)  # [8, 140, model_dim]

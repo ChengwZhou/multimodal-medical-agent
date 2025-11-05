@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from models.former import build_baseline_model
+from models.former_sensor import build_baseline_model
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, split_by_subject
 from utils.metrics import compute_metrics, print_metrics
 

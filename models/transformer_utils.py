@@ -26,7 +26,6 @@ class MultiheadSelfAttention(nn.Module):
             key = query
         if value is None:
             value = key
-
         B, Lq, D = query.shape
         Lk = key.shape[1]
 
@@ -83,6 +82,76 @@ class CrossAttentionLayer(nn.Module):
         q = q + self.mlp(q)
         return q
 
+class CrossModalAttention(nn.Module):
+    """
+    All-to-all cross-attention over a list of modality token sequences.
+
+    Args:
+        d_model: feature dim (D)
+        nhead: heads for attention
+        dim_feedforward: FFN hidden dim in CrossAttentionLayer
+        dropout: dropout used inside CrossAttentionLayer
+        include_self: 若为 True，则每个模态也可看到自身(=global attention)；False 则只看其它模态
+    """
+    def __init__(self,
+                 d_model: int,
+                 nhead: int,
+                 dim_feedforward: int = 4 * 256,
+                 dropout: float = 0.1,
+                 include_self: bool = False):
+        super().__init__()
+        self.include_self = include_self
+
+        self.cross = CrossAttentionLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout
+        )
+
+    def forward(self, per_mod_tokens, kv_masks):
+        """
+        Args:
+            per_mod_tokens: list of [B, 10, D], length = 14
+            kv_masks: [B, 140, D], 1 enable, 0 disable
+        Returns:
+            fused: [B, 140, D]
+        """
+        B, Lq, D = per_mod_tokens[0].shape
+        M = len(per_mod_tokens)  # e.g. 14
+        total_L_expected = M * Lq
+        if kv_masks is not None:
+            _, total_L, _ = kv_masks.shape
+            assert total_L == total_L_expected, f"kv_masks total length {total_L} != {total_L_expected}"
+            mask_list = list(torch.split(kv_masks, Lq, dim=1))  # list of [B, Lq, D]
+        else:
+            # 构造全 1 掩码，形状与每个 modality tokens 相同
+            mask_list = [torch.ones_like(per_mod_tokens[0]) for _ in range(M)]
+
+        # mask_list = torch.split(kv_masks, 10, dim=1)
+
+        attended = []
+        for i in range(M):
+            q = per_mod_tokens[i]  # [B, 10, D]
+
+            if self.include_self:
+                kv_list = per_mod_tokens
+                kv_mask_list = mask_list
+            else:
+                kv_list = [per_mod_tokens[j] for j in range(M) if j != i]
+                kv_mask_list = [mask_list[j] for j in range(M) if j != i]
+
+            kv = torch.cat(kv_list, dim=1)  # [B, Lkv, D]
+            kv_mask = torch.cat(kv_mask_list, dim=1)  # [B, Lkv, D]
+
+            kv = kv * kv_mask
+
+            out_i = self.cross(q=q, kv=kv)
+            attended.append(out_i)
+
+        fused = torch.cat(attended, dim=1)  # [B, 140, D]
+        return fused
+
 
 class TransformerLayer(nn.Module):
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1):
@@ -114,7 +183,6 @@ class TransformerBlock(nn.Module):
     def __init__(self, encoder_layer: nn.Module, num_layers: int):
         super().__init__()
 
-        # Add debug code to see what attributes TransformerLayer has
         # Add debug code to see what attributes TransformerLayer has
         # print("TransformerLayer attributes:", [attr for attr in dir(encoder_layer) if not attr.startswith('_')])
 

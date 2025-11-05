@@ -430,6 +430,7 @@ class ResNet1DMoE(nn.Module):
         if self.use_bn:
             out = self.final_bn(out)
         out = self.final_relu(out)
+        out_f = out
         out = out.mean(-1)
         if self.verbose:
             print('final pooling', out.shape)
@@ -449,7 +450,9 @@ class ResNet1DMoE(nn.Module):
         gate_weights_2 = self.gating_network_2(out)  # (batch_size, n_experts)
         out_moe2 = torch.sum(gate_weights_2.unsqueeze(2) * expert_outputs_2, dim=1)  # Weighted sum of experts
 
-        return out_class, out_moe1, out_moe2, out
+        # return out_class, out_moe1, out_moe2, out_f
+
+        return out_f
 
 class ResNet1DBackBone(nn.Module):
     """
@@ -561,57 +564,6 @@ class ResNet1DBackBone(nn.Module):
         
         return out
 
-class TFCResNet(nn.Module):
-    def __init__(self, model_config):
-        super(TFCResNet, self).__init__()
-        self.resnet_encoder_t = ResNet1DBackBone(in_channels=1, 
-                            base_filters=model_config['base_filters'], 
-                            kernel_size=model_config['kernel_size'],
-                            stride=model_config['stride'],
-                            groups=model_config['groups'],
-                            n_block=model_config['n_block'],
-                            n_classes=model_config['n_classes'])
-
-        self.projector_t = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Linear(256, 128)
-        )
-
-        self.resnet_encoder_f = ResNet1DBackBone(in_channels=1, 
-                            base_filters=model_config['base_filters'], 
-                            kernel_size=model_config['kernel_size'],
-                            stride=model_config['stride'],
-                            groups=model_config['groups'],
-                            n_block=model_config['n_block'],
-                            n_classes=model_config['n_classes'])
-
-        self.projector_f = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Linear(256, 128)
-        )
-
-
-    def forward(self, x_in_t, x_in_f):
-        """Use Transformer"""
-        x = self.resnet_encoder_t(x_in_t)
-        h_time = x.mean(-1)
-
-        """Cross-space projector"""
-        z_time = self.projector_t(h_time)
-
-        """Frequency-based contrastive encoder"""
-        f = self.resnet_encoder_f(x_in_f)
-        h_freq = f.mean(-1)
-        
-        """Cross-space projector"""
-        z_freq = self.projector_f(h_freq)
-
-        return h_time, z_time, h_freq, z_freq
-
 
 def strip_module_prefix(state_dict):
     # remove 'module.' prefix from keys if present
@@ -667,7 +619,7 @@ if __name__ == "__main__":
         'groups': 1,
         'n_block': 18,
         'n_classes': 512,  # Embedding dimension
-        'n_experts': 3
+        'n_experts': 3,
     }
 
     # Initialize Model
@@ -679,22 +631,23 @@ if __name__ == "__main__":
         groups=model_config['groups'],
         n_block=model_config['n_block'],
         n_classes=model_config['n_classes'],
-        n_experts=model_config['n_experts']
+        n_experts=model_config['n_experts'],
+        verbose=True
     )
 
-    print("✅ Model Structure")
-    print(model)
+    # print("✅ Model Structure")
+    # print(model)
 
     local_path = "/Users/chengweizhou/PycharmProjects/data/papagei_s.pt"
     load_checkpoint_to_model(model, local_path, map_location="cpu")
 
     model.eval()
     with torch.no_grad():
-        # (batch_size=4, channels=1, length=1024)
-        dummy_input = torch.randn(4, 1, 1024)
-        out_class, out_moe1, out_moe2, out_feat = model(dummy_input)
+        # (batch_size=4, channels=1, length=5000)
+        dummy_input = torch.randn(4, 1, 5000)
+        out_feat = model(dummy_input)
 
-        print(f"out_class shape: {out_class.shape}")   # (4, 512)
-        print(f"out_moe1 shape: {out_moe1.shape}")  # (4, 1)
-        print(f"out_moe2 shape: {out_moe2.shape}")  # (4, 1)
-        print(f"out_featshape: {out_feat.shape}")       # (4, 512)
+        # print(f"out_class shape: {out_class.shape}")   # (4, 512)
+        # print(f"out_moe1 shape: {out_moe1.shape}")  # (4, 1)
+        # print(f"out_moe2 shape: {out_moe2.shape}")  # (4, 1)
+        print(f"out_featshape: {out_feat.shape}")       # (4, 512, 10)

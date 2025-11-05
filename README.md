@@ -12,7 +12,7 @@ The baseline leverages **Transformer-based modality sub-networks + fusion**, wit
     ├── ScientISST_MOVE_loader.py # Data loading, EDF parsing, temporal slicing, multi-modal alignment
     └── metrics.py
 ├── models
-    ├── former.py # Multi-modal baseline model with modality subnets + fusion
+    ├── former_sensor.py # Multi-modal baseline model with modality subnets + fusion
     ├── transformer_utils.py 
     └── cnn.py
 ├── train.py # Training script (supports single GPU and DDP)

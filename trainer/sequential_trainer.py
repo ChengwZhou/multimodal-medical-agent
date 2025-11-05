@@ -30,7 +30,7 @@ import json
 import time
 
 import argparse
-from models.former import build_former
+from models.former_sensor import build_former
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
 from utils.metrics import compute_metrics, print_metrics
 

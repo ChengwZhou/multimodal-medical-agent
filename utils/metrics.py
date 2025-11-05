@@ -33,6 +33,7 @@ def compute_metrics(y_true, y_pred, average='macro'):
 
 
 def print_metrics(metrics):
+    print("===val metrics===")
     print(f"Accuracy: {metrics['accuracy']:.4f}")
     print(f"F1-score: {metrics['f1_score']:.4f}")
     print("Confusion Matrix:")

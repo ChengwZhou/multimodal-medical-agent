@@ -95,14 +95,6 @@ class ECGTransformerClassificationModel(nn.Module):
     6. Global Average Pooling (with padding mask) → [B, encoder_embed_dim]
        ↓
     7. Classification Head: Linear → [B, num_labels]
-
-    Usage:
-        cfg = ECGTransformerClassificationConfig(num_labels=5)
-        model = ECGTransformerClassificationModel(cfg)
-        # Or load pretrained weights
-        model = ECGTransformerClassificationModel.from_pretrained(cfg, checkpoint_path)
-        output = model(source=ecg_data, padding_mask=mask)
-        logits = output["out"]  # [B, num_labels]
     """
 
     def __init__(self, cfg: ECGTransformerClassificationConfig):
@@ -111,7 +103,7 @@ class ECGTransformerClassificationModel(nn.Module):
 
         # ============ 1. Convolutional Feature Extractor ============
         feature_enc_layers = eval(cfg.conv_feature_layers)
-        self.embed = feature_enc_layers[-1][0]  # output dim of conv layers
+        self.embed = feature_enc_layers[-1][0]
 
         self.feature_extractor = ConvFeatureExtraction(
             conv_layers=feature_enc_layers,
@@ -124,7 +116,6 @@ class ECGTransformerClassificationModel(nn.Module):
         self.feature_grad_mult = cfg.feature_grad_mult
         self.layer_norm = LayerNorm(self.embed)
 
-        # Project conv output to transformer dim if needed
         self.post_extract_proj = (
             nn.Linear(self.embed, cfg.encoder_embed_dim)
             if self.embed != cfg.encoder_embed_dim else None
@@ -165,7 +156,6 @@ class ECGTransformerClassificationModel(nn.Module):
 
     def _extract_conv_features(self, source, padding_mask):
         """Step 1: Extract convolutional features"""
-        # Apply conv with optional gradient scaling
         if self.feature_grad_mult > 0:
             features = self.feature_extractor(source)
             if self.feature_grad_mult != 1.0:
@@ -174,11 +164,9 @@ class ECGTransformerClassificationModel(nn.Module):
             with torch.no_grad():
                 features = self.feature_extractor(source)
 
-        # [B, embed, T] -> [B, T, embed]
         features = features.transpose(1, 2)
         features = self.layer_norm(features)
 
-        # Update padding mask based on conv output length
         if padding_mask is not None and padding_mask.any():
             input_lengths = (1 - padding_mask.long()).sum(-1)
             if input_lengths.dim() > 1:
@@ -200,7 +188,6 @@ class ECGTransformerClassificationModel(nn.Module):
         else:
             padding_mask = None
 
-        # Project to transformer dimension
         if self.post_extract_proj is not None:
             features = self.post_extract_proj(features)
 
@@ -221,162 +208,84 @@ class ECGTransformerClassificationModel(nn.Module):
 
     def _global_average_pooling(self, x, padding_mask):
         """Step 4: Global average pooling over time dimension"""
-        # Apply dropout
         x = self.final_dropout(x)
-
-        # Zero out padded positions
         if padding_mask is not None and padding_mask.any():
             x[padding_mask] = 0
-
-        # Average pooling: sum / count of non-zero positions
         x = torch.div(x.sum(dim=1), (x != 0).sum(dim=1))
-
         return x
 
-    def forward(self, source, padding_mask=None, **kwargs):
+    def forward(self, source, padding_mask=None, return_embeddings=False, **kwargs):
         """
         Forward pass
 
         Args:
             source: [B, in_d, T] - input ECG signals
             padding_mask: [B, T] - True for padded positions
+            return_embeddings: if True, return embeddings; if False, return logits
 
         Returns:
-            dict:
-                - out: [B, num_labels] classification logits
-                - encoder_out: [B, T', encoder_embed_dim] transformer output
-                - padding_mask: [B, T'] updated padding mask
-                - saliency: attention weights (if enabled)
+            if return_embeddings=True: [B, T', encoder_embed_dim] embeddings
+            if return_embeddings=False: dict with 'out' (logits), 'encoder_out', etc.
         """
-        # Determine if encoder should be frozen
         freeze_encoder = self.num_updates < self.freeze_finetune_updates
 
         with torch.no_grad() if freeze_encoder else contextlib.ExitStack():
-            # Step 1: Conv feature extraction
             x, padding_mask = self._extract_conv_features(source, padding_mask)
-
-            # Step 2: Add positional encoding
             x = self._add_positional_encoding(x)
-
-            # Step 3: Transformer encoding
             res = self._apply_transformer(x, padding_mask)
-            x = res["x"]
+            x = res["x"]  # [B, T', encoder_embed_dim]
             saliency = res["saliency"]
 
-        # Step 4: Global average pooling
-        pooled = self._global_average_pooling(x, padding_mask)
+        # if return_embeddings:
+        #     # Return sequence embeddings
 
-        # Step 5: Classification
-        logits = self.proj(pooled)
+        x = x.transpose(1, 2)  # [B, encoder_embed_dim, T']
+        return x
 
-        return {
-            "out": logits,
-            "encoder_out": x.detach(),
-            "padding_mask": padding_mask,
-            "saliency": None if saliency is None else saliency.detach(),
-        }
-
-    def get_logits(self, net_output, normalize=False, **kwargs):
-        """Get classification logits (optionally normalized)"""
-        logits = net_output["out"]
-        if normalize:
-            logits = F.log_softmax(logits.float(), dim=-1)
-        return logits
-
-    def get_targets(self, sample, net_output, **kwargs):
-        """Extract targets from sample"""
-        if isinstance(sample["label"], torch.Tensor):
-            return sample["label"].float()
-        else:
-            return sample["label"]
-
-    def get_normalized_probs(self, net_output, log_probs=True):
-        """Get normalized probabilities"""
-        logits = self.get_logits(net_output)
-        if log_probs:
-            return F.log_softmax(logits.float(), dim=-1)
-        else:
-            return F.softmax(logits.float(), dim=-1)
-
-    def set_num_updates(self, num_updates):
-        """Update training step counter"""
-        self.num_updates = num_updates
+        # # Continue with pooling and classification
+        # pooled = self._global_average_pooling(x, padding_mask)
+        # logits = self.proj(pooled)
+        #
+        # return {
+        #     "out": logits,
+        #     "encoder_out": x,
+        #     "padding_mask": padding_mask,
+        #     "saliency": None if saliency is None else saliency,
+        # }
 
     @staticmethod
     def _remap_checkpoint_keys(state_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Remap checkpoint keys from old fairseq_signals format to new format
-
-        Old format has nested structure:
-            encoder.feature_extractor.* -> feature_extractor.*
-            encoder.encoder.layers.* -> encoder.layers.*
-            encoder.layer_norm.* -> layer_norm.*
-            encoder.post_extract_proj.* -> post_extract_proj.*
-            encoder.conv_pos.* -> conv_pos.*
-
-        Args:
-            state_dict: original checkpoint state dict
-
-        Returns:
-            remapped state dict
-        """
+        """Remap checkpoint keys from old fairseq_signals format"""
         new_state_dict = {}
-
         for key, value in state_dict.items():
             new_key = key
-
-            # Remove "encoder." prefix for feature extractor components
             if key.startswith("encoder.feature_extractor."):
                 new_key = key.replace("encoder.feature_extractor.", "feature_extractor.")
             elif key.startswith("encoder.post_extract_proj."):
                 new_key = key.replace("encoder.post_extract_proj.", "post_extract_proj.")
             elif key.startswith("encoder.conv_pos."):
                 new_key = key.replace("encoder.conv_pos.", "conv_pos.")
-            # Handle transformer encoder layers (double encoder prefix)
             elif key.startswith("encoder.encoder."):
                 new_key = key.replace("encoder.encoder.", "encoder.")
-            # Handle layer_norm (but not the one inside encoder)
             elif key == "encoder.layer_norm.weight" or key == "encoder.layer_norm.bias":
                 new_key = key.replace("encoder.layer_norm.", "layer_norm.")
 
-            # Handle weight normalization: weight_g and weight_v -> parametrizations
             if "weight_g" in new_key:
                 new_key = new_key.replace("weight_g", "parametrizations.weight.original0")
             elif "weight_v" in new_key:
                 new_key = new_key.replace("weight_v", "parametrizations.weight.original1")
 
             new_state_dict[new_key] = value
-
         return new_state_dict
 
     @classmethod
-    def from_pretrained(
-            cls,
-            cfg: ECGTransformerClassificationConfig,
-            checkpoint_path: str,
-            strict: bool = False,
-            map_location: str = "cpu"
-    ):
-        """
-        Load model from pretrained checkpoint
-
-        Args:
-            cfg: model configuration
-            checkpoint_path: path to checkpoint file
-            strict: whether to strictly enforce key matching
-            map_location: device to map tensors to
-
-        Returns:
-            ECGTransformerClassificationModel instance with loaded weights
-        """
+    def from_pretrained(cls, cfg, checkpoint_path, strict=False, map_location="cpu"):
+        """Load model from pretrained checkpoint"""
         model = cls(cfg)
-
         logger.info(f"Loading pretrained weights from {checkpoint_path}")
 
-        # Load checkpoint
         state = torch.load(checkpoint_path, map_location=torch.device(map_location), weights_only=False)
 
-        # Extract model state dict
         if "model" in state:
             state_dict = state["model"]
         elif "state_dict" in state:
@@ -384,73 +293,134 @@ class ECGTransformerClassificationModel(nn.Module):
         else:
             state_dict = state
 
-        # Remap keys from old format to new format
         state_dict = cls._remap_checkpoint_keys(state_dict)
 
-        if strict:
-            # Strict mode: load all matching keys
-            model.load_state_dict(state_dict, strict=True)
-            logger.info("Loaded all weights (strict mode)")
-        else:
-            # Non-strict mode: load only matching keys
+        if not strict:
             model_dict = model.state_dict()
             pretrained_dict = {
                 k: v for k, v in state_dict.items()
                 if k in model_dict and model_dict[k].shape == v.shape
             }
-
-            # Show what's being loaded
-            missing_keys = set(model_dict.keys()) - set(pretrained_dict.keys())
-            unexpected_keys = set(state_dict.keys()) - set(model_dict.keys())
-
-            # Filter out projection head keys from missing (they're new)
-            missing_keys = {k for k in missing_keys if not k.startswith("proj.")}
-
             model_dict.update(pretrained_dict)
             model.load_state_dict(model_dict)
-
             logger.info(f"Loaded {len(pretrained_dict)}/{len(model_dict)} parameters")
-            if missing_keys:
-                logger.info(f"Missing keys (will use random init): {len(missing_keys)}")
-                logger.debug(f"Missing keys: {missing_keys}")
-            if unexpected_keys:
-                logger.info(f"Unexpected keys (ignored): {len(unexpected_keys)}")
-                logger.debug(f"Unexpected keys: {unexpected_keys}")
+        else:
+            model.load_state_dict(state_dict, strict=True)
+            logger.info("Loaded all weights (strict mode)")
 
         return model
 
-    @classmethod
-    def build_model(cls, cfg: ECGTransformerClassificationConfig):
-        """
-        Build model with optional pretrained weight loading
 
-        Args:
-            cfg: model configuration
+# ============================================================================
+# Single-Lead Adaptation Utilities
+# ============================================================================
 
-        Returns:
-            ECGTransformerClassificationModel instance
-        """
-        # If pretrained weights specified, load them
-        if cfg.model_path and not cfg.no_pretrained_weights:
-            return cls.from_pretrained(cfg, cfg.model_path, strict=False)
-        else:
-            return cls(cfg)
-
-
-def load_checkpoint_and_config(checkpoint_path: str, map_location: str = "cpu") -> tuple:
+def adapt_single_lead_to_12lead(single_lead_signal, lead_index=0, method="zero_pad"):
     """
-    Helper function to load checkpoint and extract configuration
+    Adapt single-lead ECG to 12-lead format
 
     Args:
-        checkpoint_path: path to checkpoint file
-        map_location: device to map tensors to
+        single_lead_signal: [B, 1, T] - single lead ECG
+        lead_index: which lead position (0=Lead I, 1=Lead II, etc.)
+        method: "zero_pad" or "repeat"
 
     Returns:
-        tuple: (state_dict, config_dict)
+        [B, 12, T] - adapted to 12-lead format
     """
+    B, C, T = single_lead_signal.shape
+    assert C == 1, f"Expected 1 channel, got {C}"
+
+    if method == "zero_pad":
+        output = torch.zeros(B, 12, T, device=single_lead_signal.device, dtype=single_lead_signal.dtype)
+        output[:, lead_index:lead_index + 1, :] = single_lead_signal
+    elif method == "repeat":
+        output = single_lead_signal.repeat(1, 12, 1)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    return output
+
+
+class SingleLeadAdapter(nn.Module):
+    """Learnable adapter: single-lead → 12-lead prediction"""
+
+    def __init__(self, hidden_dim=128):
+        super().__init__()
+        self.conv1 = nn.Conv1d(1, hidden_dim, kernel_size=15, padding=7)
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=15, padding=7)
+        self.conv3 = nn.Conv1d(hidden_dim, 12, kernel_size=15, padding=7)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        """[B, 1, T] -> [B, 12, T]"""
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.conv3(x)
+        return x
+
+
+class ECG12LeadModelWithSingleLeadSupport(nn.Module):
+    """
+    Wrapper for 12-lead model that supports single-lead input
+
+    Use this when you have a 12-lead pretrained model but single-lead data
+    """
+
+    def __init__(self, ecg_12lead_model, adaptation_method="zero_pad", lead_index=0, learnable_adapter=None):
+        """
+        Args:
+            ecg_12lead_model: pretrained 12-lead ECGTransformerClassificationModel
+            adaptation_method: "zero_pad", "repeat", or "learnable"
+            lead_index: which lead position (0=I, 1=II, 2=III, etc.)
+            learnable_adapter: SingleLeadAdapter instance (required if method="learnable")
+        """
+        super().__init__()
+        self.ecg_model = ecg_12lead_model
+        self.adaptation_method = adaptation_method
+        self.lead_index = lead_index
+
+        if adaptation_method == "learnable":
+            self.adapter = learnable_adapter if learnable_adapter else SingleLeadAdapter()
+            # Freeze ECG model by default when using learnable adapter
+            for param in self.ecg_model.parameters():
+                param.requires_grad = False
+        else:
+            self.adapter = None
+
+    def unfreeze_ecg_model(self):
+        """Unfreeze ECG model for end-to-end training"""
+        for param in self.ecg_model.parameters():
+            param.requires_grad = True
+
+    def forward(self, single_lead_input, padding_mask=None, return_embeddings=False, **kwargs):
+        """
+        Args:
+            single_lead_input: [B, 1, T] - single lead ECG
+
+        Returns:
+            same as ECGTransformerClassificationModel
+        """
+        if self.adaptation_method == "learnable":
+            twelve_lead_input = self.adapter(single_lead_input)
+        else:
+            twelve_lead_input = adapt_single_lead_to_12lead(
+                single_lead_input,
+                lead_index=self.lead_index,
+                method=self.adaptation_method
+            )
+
+        return self.ecg_model(twelve_lead_input, padding_mask=padding_mask, return_embeddings=return_embeddings,
+                              **kwargs)
+
+
+# ============================================================================
+# Convenience Functions
+# ============================================================================
+
+def load_checkpoint_and_config(checkpoint_path: str, map_location: str = "cpu") -> tuple:
+    """Load checkpoint and extract configuration"""
     state = torch.load(checkpoint_path, map_location=torch.device(map_location), weights_only=False)
 
-    # Extract model state dict
     if "model" in state:
         state_dict = state["model"]
     elif "state_dict" in state:
@@ -458,7 +428,6 @@ def load_checkpoint_and_config(checkpoint_path: str, map_location: str = "cpu") 
     else:
         state_dict = state
 
-    # Extract config
     if "cfg" in state:
         cfg_dict = state["cfg"]
         if "model" in cfg_dict:
@@ -471,40 +440,85 @@ def load_checkpoint_and_config(checkpoint_path: str, map_location: str = "cpu") 
     return state_dict, cfg_dict
 
 
+def get_ecg_fm(pretrained=True, local_path="/Users/chengweizhou/PycharmProjects/data/mimic_iv_ecg_finetuned.pt",
+               return_embeddings=False):
+    """
+    Get ECG Foundation Model (12-lead)
+
+    Args:
+        pretrained: load pretrained weights
+        local_path: path to checkpoint
+        return_embeddings: if True, model returns embeddings; if False, returns logits
+
+    Returns:
+        model configured for embeddings or classification
+    """
+    state_dict, cfg_dict = load_checkpoint_and_config(local_path)
+    cfg = ECGTransformerClassificationConfig(
+        num_labels=cfg_dict.get("num_labels", 5),
+        encoder_embed_dim=cfg_dict.get("encoder_embed_dim", 768),
+        encoder_layers=cfg_dict.get("encoder_layers", 12),
+    )
+
+    model = ECGTransformerClassificationModel.from_pretrained(
+        cfg=cfg,
+        checkpoint_path=local_path,
+        strict=False
+    )
+
+    return model
+
+
+def get_single_lead_ecg_model(pretrained_12lead_path, adaptation_method="zero_pad", lead_index=0):
+    """
+    Get single-lead ECG model using 12-lead pretrained weights
+
+    Args:
+        pretrained_12lead_path: path to 12-lead checkpoint
+        adaptation_method: "zero_pad", "repeat", or "learnable"
+        lead_index: which lead (0=I, 1=II, 2=III, ...)
+
+    Returns:
+        model that accepts [B, 1, T] single-lead input
+    """
+    # Load 12-lead model
+    ecg_12lead_model = get_ecg_fm(pretrained=True, local_path=pretrained_12lead_path)
+
+    # Wrap with single-lead support
+    model = ECG12LeadModelWithSingleLeadSupport(
+        ecg_12lead_model=ecg_12lead_model,
+        adaptation_method=adaptation_method,
+        lead_index=lead_index
+    )
+
+    print(f"✅ Single-lead ECG model ready (method={adaptation_method}, lead={lead_index})")
+    return model
+
+
+# ============================================================================
+# Example Usage
+# ============================================================================
+
 if __name__ == "__main__":
-    # Example usage
     local_path = "/Users/chengweizhou/PycharmProjects/data/mimic_iv_ecg_finetuned.pt"
 
-    # Load checkpoint and config
-    state_dict, cfg_dict = load_checkpoint_and_config(local_path)
+    # print("=" * 70)
+    # print("Load 12-lead model and use with 12-lead data")
+    # print("=" * 70)
+    # model_12lead = get_ecg_fm(local_path=local_path)
+    # ecg_12lead_data = torch.randn(2, 12, 1500)
+    # output = model_12lead(ecg_12lead_data, return_embeddings=True)
+    # print(f"Input: {ecg_12lead_data.shape} -> Output: {output.shape}\n")
 
-    print("Config keys:", cfg_dict.keys() if cfg_dict else "No config found")
-    print("Model state dict keys:", len(state_dict.keys()))
-
-    # Create config from checkpoint
-    if cfg_dict:
-        # Convert namespace or dict to config
-        cfg = ECGTransformerClassificationConfig(
-            num_labels=cfg_dict.get("num_labels", 5),
-            encoder_embed_dim=cfg_dict.get("encoder_embed_dim", 768),
-            encoder_layers=cfg_dict.get("encoder_layers", 12),
-            # in_d=1
-            # Add other fields as needed
-        )
-
-        # Load model
-        model = ECGTransformerClassificationModel.from_pretrained(
-            cfg=cfg,
-            checkpoint_path=local_path,
-            strict=True
-        )
-
-        print(f"Model loaded successfully with {sum(p.numel() for p in model.parameters())} parameters")
-
-        ecg_data = torch.randn(2, 12, 5000)  # [batch=2, channels=12, time=5000]
-
-        output = model(ecg_data)
-
-        output = model(ecg_data, verbose=True)
-        print(output.keys())
-        print(output["out"].shape, output["encoder_out"].shape)  #torch.Size([2, 17]) torch.Size([2, 312, 768])
+    print("=" * 70)
+    print("Single-lead with zero-padding (fastest, no training)")
+    print("=" * 70)
+    model_single_zeropad = get_single_lead_ecg_model(
+        local_path,
+        adaptation_method="zero_pad",
+        lead_index=0  # Lead I
+    )
+    single_lead_data = torch.randn(2, 1, 1600)  # Lead I data
+    output = model_single_zeropad(single_lead_data, return_embeddings=True)
+    print(f"Input: {single_lead_data.shape} -> Output: {output.shape}")
+    print("Lead I at position 0, rest are zeros\n")  # Input: torch.Size([2, 1, 1600]) -> Output: torch.Size([2, 768, 100])
