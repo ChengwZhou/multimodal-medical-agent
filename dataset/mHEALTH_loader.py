@@ -355,7 +355,7 @@ if __name__ == "__main__":
 
         print("Testing get_subject_sequence with balance=True...")
         try:
-            sequence = balanced_dataset(balanced_dataset.subject_ids[0])
+            sequence = balanced_dataset.subject_ids[0]
             print("  ⚠ Unexpected: get_subject_sequence did not raise an error")
         except RuntimeError as e:
             print(f"  ✓ Expected error caught: {e}")

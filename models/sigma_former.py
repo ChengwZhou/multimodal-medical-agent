@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.transformer_utils import CrossAttentionLayer, TransformerLayer, TransformerBlock, CrossModalAttention
+from utils.modality_config import ModalityConfig
 
 
 # -----------------------------
@@ -28,16 +29,102 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :L]
 
 
+# class AdaptivetiveSensingModule(nn.Module):
+#     """
+#     Adaptive sensing module with learnable threshold for each modality.
+#     When |delta_input| < threshold, the sensor is turned off for skip_steps.
+#
+#     Args:
+#         init_threshold: Initial threshold value
+#         skip_steps: Number of timesteps to skip when threshold is not met (can be int or 'learnable')
+#         min_threshold: Minimum allowed threshold value
+#         max_threshold: Maximum allowed threshold value
+#     """
+#
+#     def __init__(self,
+#                  init_threshold: float = 0.1,
+#                  skip_steps: int = 5,
+#                  learnable_skip: bool = False,
+#                  min_threshold: float = 0.01,
+#                  max_threshold: float = 1.0):
+#         super().__init__()
+#
+#         # Learnable threshold (in log space for numerical stability)
+#         self.log_threshold = nn.Parameter(torch.tensor(math.log(init_threshold)))
+#         self.min_threshold = min_threshold
+#         self.max_threshold = max_threshold
+#
+#         # Skip steps configuration
+#         self.learnable_skip = learnable_skip
+#         if learnable_skip:
+#             # Use log space and round to nearest integer during forward
+#             self.log_skip_steps = nn.Parameter(torch.tensor(math.log(float(skip_steps))))
+#             self.min_skip = 1
+#             self.max_skip = 20
+#         else:
+#             self.skip_steps = skip_steps
+#
+#     def get_threshold(self) -> torch.Tensor:
+#         """Get the current threshold value with clamping"""
+#         threshold = torch.exp(self.log_threshold)
+#         return torch.clamp(threshold, self.min_threshold, self.max_threshold)
+#
+#     def get_skip_steps(self) -> int:
+#         """Get the current skip steps value"""
+#         if self.learnable_skip:
+#             skip = torch.exp(self.log_skip_steps)
+#             skip = torch.clamp(skip, self.min_skip, self.max_skip)
+#             return int(torch.round(skip).item())
+#         else:
+#             return self.skip_steps
+#
+#     def forward(self, delta_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+#         """
+#         Apply adaptive sensing mask to delta input.
+#         When timesteps are masked, the next active delta accumulates all skipped deltas.
+#
+#         Args:
+#             delta_input: [B, 1, T] - delta values: x0, x1-x0, x2-x1, ...
+#
+#         Returns:
+#             masked_input: [B, 1, T] - adjusted delta input (aggregated over masked periods)
+#             mask: [B, 1, T] - binary mask (1=active, 0=masked/sensor off)
+#         """
+#         B, C, T = delta_input.shape
+#         assert C == 1
+#         x = delta_input.squeeze(1)  # [B, T]
+#
+#         threshold = self.get_threshold()
+#         skip_steps = self.get_skip_steps()
+#
+#         # Initialize per-batch state
+#         timer = torch.zeros(B, dtype=torch.long, device=x.device)  # skip remaining
+#         accum = torch.zeros(B, dtype=x.dtype, device=x.device)  # accumulated delta
+#         mask = torch.zeros_like(x)
+#         masked = torch.zeros_like(x)
+#
+#         for t in range(T):
+#             curr = x[:, t]
+#             is_on = timer <= 0
+#             adj = curr + accum
+#
+#             trigger_off = is_on & (torch.abs(adj) < threshold)
+#
+#             # Update state
+#             timer = torch.where(trigger_off, torch.full_like(timer, skip_steps), torch.clamp(timer - 1, min=0))
+#             mask[:, t] = (is_on & ~trigger_off).float()
+#             masked[:, t] = torch.where(is_on & ~trigger_off, adj, torch.zeros_like(curr))
+#
+#             # Update accumulation
+#             accum = torch.where(is_on & ~trigger_off, torch.zeros_like(accum), accum + curr)
+#             accum = torch.where(trigger_off, adj, accum)
+#
+#         return masked.unsqueeze(1), mask.unsqueeze(1)
+
+
 class AdaptiveSensingModule(nn.Module):
     """
-    Adaptive sensing module with learnable threshold for each modality.
-    When |delta_input| < threshold, the sensor is turned off for skip_steps.
-
-    Args:
-        init_threshold: Initial threshold value
-        skip_steps: Number of timesteps to skip when threshold is not met (can be int or 'learnable')
-        min_threshold: Minimum allowed threshold value
-        max_threshold: Maximum allowed threshold value
+    Fully vectorized adaptive sensing (no Python loops over B or T).
     """
 
     def __init__(self,
@@ -47,89 +134,115 @@ class AdaptiveSensingModule(nn.Module):
                  min_threshold: float = 0.01,
                  max_threshold: float = 1.0):
         super().__init__()
-
-        # Learnable threshold (in log space for numerical stability)
         self.log_threshold = nn.Parameter(torch.tensor(math.log(init_threshold)))
         self.min_threshold = min_threshold
         self.max_threshold = max_threshold
 
-        # Skip steps configuration
         self.learnable_skip = learnable_skip
         if learnable_skip:
-            # Use log space and round to nearest integer during forward
             self.log_skip_steps = nn.Parameter(torch.tensor(math.log(float(skip_steps))))
             self.min_skip = 1
             self.max_skip = 20
         else:
             self.skip_steps = skip_steps
 
+    # --------------------------------------------------------------------- #
+    #  工具函数
+    # --------------------------------------------------------------------- #
     def get_threshold(self) -> torch.Tensor:
-        """Get the current threshold value with clamping"""
-        threshold = torch.exp(self.log_threshold)
-        return torch.clamp(threshold, self.min_threshold, self.max_threshold)
+        th = torch.exp(self.log_threshold)
+        return torch.clamp(th, self.min_threshold, self.max_threshold)
 
     def get_skip_steps(self) -> int:
-        """Get the current skip steps value"""
         if self.learnable_skip:
-            skip = torch.exp(self.log_skip_steps)
-            skip = torch.clamp(skip, self.min_skip, self.max_skip)
-            return int(torch.round(skip).item())
-        else:
-            return self.skip_steps
+            s = torch.exp(self.log_skip_steps)
+            s = torch.clamp(s, self.min_skip, self.max_skip)
+            return int(torch.round(s).item())
+        return self.skip_steps
 
-    def forward(self, delta_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # --------------------------------------------------------------------- #
+    #  完全向量化 forward
+    # --------------------------------------------------------------------- #
+    def forward(self, delta_input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply adaptive sensing mask to delta input.
-        When timesteps are masked, the next active delta accumulates all skipped deltas.
-
         Args:
-            delta_input: [B, 1, T] - delta values: x0, x1-x0, x2-x1, ...
+            delta_input: [B, 1, T]  (differenced signal)
 
         Returns:
-            masked_input: [B, 1, T] - adjusted delta input (aggregated over masked periods)
-            mask: [B, 1, T] - binary mask (1=active, 0=masked/sensor off)
+            masked_input: [B, 1, T]  (adjusted delta, zero where sensor OFF)
+            mask:         [B, 1, T]  (1 = active, 0 = OFF)
         """
         B, C, T = delta_input.shape
         assert C == 1, "Expected single channel input"
+        x = delta_input.squeeze(1)                     # [B, T]
 
-        threshold = self.get_threshold()
-        skip_steps = self.get_skip_steps()
+        threshold = self.get_threshold()               # scalar
+        skip_steps = self.get_skip_steps()             # int
+        device = x.device
 
-        # Initialize mask and output
-        mask = torch.ones_like(delta_input)  # [B, 1, T]
-        masked_input = torch.zeros_like(delta_input)  # [B, 1, T]
+        # --------------------------------------------------------------- #
+        # 1. 构建时间索引
+        # --------------------------------------------------------------- #
+        t_idx = torch.arange(T, device=device).unsqueeze(0).expand(B, T)   # [B, T]
 
-        # Process each sample in batch
-        for b in range(B):
-            skip_until = 0  # Track when sensor can be turned on again
-            accumulated_delta = 0.0  # Accumulate deltas during skip period
+        # --------------------------------------------------------------- #
+        # 2. 累计 delta（在 sensor OFF 时累积）
+        #    这里我们先算出 **所有可能的累计值**，后面再 mask
+        # --------------------------------------------------------------- #
+        # 为了得到真正的 accum，需要知道 sensor 在何时 OFF。
+        # 我们先假设所有位置都是 OFF，累计全部 delta → cum_x
+        cum_x = torch.cumsum(x, dim=1)                 # [B, T]
 
-            for t in range(T):
-                if t < skip_until:
-                    # Sensor is off: accumulate this delta
-                    mask[b, 0, t] = 0
-                    masked_input[b, 0, t] = 0
-                    accumulated_delta += delta_input[b, 0, t].item()
-                else:
-                    # Sensor is on: add accumulated delta to current delta
-                    adjusted_delta = delta_input[b, 0, t] + accumulated_delta
+        # --------------------------------------------------------------- #
+        # 3. 构造 “潜在触发点” （如果 sensor ON 且 |adj| < th）
+        #    这里的 adj = x + accum_prev
+        #    我们用 “上一次活跃的累计” 近似（后面会修正）
+        # --------------------------------------------------------------- #
+        # 先算一个 **粗糙的 adj**：使用上一步的累计（左移一位）
+        adj_approx = x + torch.cat([torch.zeros(B, 1, device=device),
+                                   cum_x[:, :-1]], dim=1)   # [B, T]
 
-                    # Check if adjusted delta exceeds threshold
-                    if torch.abs(adjusted_delta) < threshold:
-                        # Delta below threshold: turn off sensor for next skip_steps
-                        mask[b, 0, t] = 0
-                        masked_input[b, 0, t] = 0
-                        skip_until = t + skip_steps
-                        # Start accumulating from this delta
-                        accumulated_delta = adjusted_delta.item()
-                    else:
-                        # Delta exceeds threshold: keep sensor on
-                        mask[b, 0, t] = 1
-                        masked_input[b, 0, t] = adjusted_delta
-                        # Reset accumulator
-                        accumulated_delta = 0.0
+        # 潜在触发：sensor 必须 ON（timer[t-1]==0）且 |adj| < th
+        potential_trigger = torch.abs(adj_approx) < threshold   # [B, T]
+        # 4. 用 **cummax** 传播最近一次触发点 → skip_end
+        # 把触发点映射为 “skip 结束时间” = t + skip_steps
+        skip_end_candidate = torch.where(
+            potential_trigger,
+            t_idx + skip_steps,                         # 触发 → skip 到 t+skip_steps
+            torch.full_like(t_idx, -1)                  # 不触发 → 无效
+        )                                                # [B, T]
+        # 因果 cummax：每个位置保留 **最近一次** 有效的 skip_end
+        # (从左到右传播，-1 会被后面的有效值覆盖)
+        skip_end = torch.cummax(skip_end_candidate, dim=1).values   # [B, T]
+        # 5. 计算真实的 **timer**（剩余 skip 步数）
+        timer = torch.clamp(skip_end - t_idx, min=0)                # [B, T]
+        # 6. 真正的 **active** 位置：timer[t] == 0
+        active = timer == 0                                         # [B, T]
+        # 7. 真正的 **adjusted delta**（使用真实的累计） 累计只在 sensor OFF 时累加 → 只在 non-active 位置累加 构造 “是否在 OFF 期间” 的 mask
+        off_mask = ~active                                           # [B, T]
 
-        return masked_input, mask
+        # OFF 期间的累计增量 = x[t] （只在 OFF 时加）
+        delta_off = x * off_mask.float()
+
+        # 前缀和得到 OFF 期间累计的总和
+        accum_off = torch.cumsum(delta_off, dim=1)                   # [B, T]
+
+        # 真正的 adj = x + 上一时刻的累计（在 OFF 期间累计的）
+        # 上一时刻累计 = accum_off[t-1]（左移）
+        accum_prev = torch.cat([torch.zeros(B, 1, device=device),
+                               accum_off[:, :-1]], dim=1)           # [B, T]
+
+        adj = x + accum_prev                                        # [B, T]
+
+        # --------------------------------------------------------------- #
+        # 8. 最终 mask & masked_input
+        # --------------------------------------------------------------- #
+        # 只有 active 位置才输出 adj，其余为 0
+        masked = adj * active.float()                               # [B, T]
+        mask   = active.float()                                     # [B, T]
+
+        # 恢复通道维度
+        return masked.unsqueeze(1), mask.unsqueeze(1)
 
 
 class ConvTokenizer1D(nn.Module):
@@ -160,13 +273,6 @@ class ConvTokenizer1D(nn.Module):
         return x
 
 
-class ModalityConfig:
-    def __init__(self, name: str, in_ch: int, patch_size: int):
-        self.name = name
-        self.in_ch = in_ch
-        self.patch_size = patch_size
-
-
 class AdaptiveSensingMultimodalTransformer(nn.Module):
     """
     Multimodal transformer with adaptive sensing mechanism.
@@ -189,7 +295,8 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
                  init_threshold: float = 0.1,
                  skip_steps: int = 5,
                  learnable_skip: bool = False,
-                 return_sensing_info: bool = False
+                 return_sensing_info: bool = False,
+                 modal_fusion: str = "concate"  # "concate" or "cross_atten",
                  ):
         super().__init__()
 
@@ -202,6 +309,7 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
         self.modal_dropout_p = modal_dropout_p
         self.return_mem = return_mem
         self.return_sensing_info = return_sensing_info
+        self.modal_fusion = modal_fusion
 
         # Adaptive sensing fairseq_signals_modules for each modality
         self.adaptive_sensing = nn.ModuleDict()
@@ -236,11 +344,13 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
         )
 
         # Cross-Modal attention
-        self.modal_cross_attn = CrossModalAttention(
-            model_dim, nhead,
-            dim_feedforward=ff_dim,
-            dropout=dropout
-        )
+        if self.modal_fusion == "cross_atten":
+            self.modal_cross_attn = CrossModalAttention(
+                model_dim, nhead,
+                dim_feedforward=ff_dim,
+                dropout=dropout
+            )
+
         # Fusion transformer
         self.fusion = TransformerBlock(
             TransformerLayer(
@@ -305,7 +415,7 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
         # Process each modality
         for i, m in enumerate(self.modalities):
             # Extract channel
-            ch = x[:, i:i + 1, :]  # [B, 1, T]
+            ch = x[:, i:i+m.in_ch, :]  # [B, m, T]
 
             # Apply adaptive sensing
             masked_ch, mask = self.adaptive_sensing[m.name](ch)  # [B, 1, T], [B, 1, T]
@@ -313,7 +423,7 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
             # Store sensing info
             if self.return_sensing_info:
                 sensing_info['masks'].append(mask)
-                active_ratio = mask.float().mean().item()
+                active_ratio = mask.float().mean()
                 sensing_info['active_ratios'].append(active_ratio)
 
             # Tokenize masked input
@@ -323,8 +433,11 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
         # Optional modal dropout
         per_mod_tokens = self._maybe_modal_dropout(per_mod_tokens)
 
-        # modal cross attention
-        concat_tokens = self.modal_cross_attn(per_mod_tokens, kv_masks = history_mask)
+        # modal cross attention or concatenate tokens along time dimension -> [B, 14*10=140, 1]
+        if self.modal_fusion == "cross_atten":
+            concat_tokens = self.modal_cross_attn(per_mod_tokens, kv_masks=history_mask)
+        else:
+            concat_tokens = torch.cat(per_mod_tokens, dim=1)  # [B, L_total, 1]
 
 
         # Add positional encoding
@@ -364,7 +477,9 @@ def build_adaptive_sigma_former(
         init_threshold: float = 0.1,
         skip_steps: int = 5,
         learnable_skip: bool = False,
-        return_sensing_info: bool = False
+        return_sensing_info: bool = False,
+        modalities=None,
+        modal_fusion="concate"
 ):
     """
     Build adaptive sensing multimodal transformer.
@@ -379,7 +494,7 @@ def build_adaptive_sigma_former(
         learnable_skip: Whether skip_steps should be learnable
         return_sensing_info: Whether to return sensing statistics
     """
-    modalities = [ModalityConfig(f'm{i}', 1, 10) for i in range(num_modal)]
+    # modalities = [ModalityConfig(f'm{i}', 1, 10) for i in range(num_modal)]
     return AdaptiveSensingMultimodalTransformer(
         num_classes=num_classes,
         model_dim=model_dim,
@@ -395,7 +510,8 @@ def build_adaptive_sigma_former(
         init_threshold=init_threshold,
         skip_steps=skip_steps,
         learnable_skip=learnable_skip,
-        return_sensing_info=return_sensing_info
+        return_sensing_info=return_sensing_info,
+        modal_fusion=modal_fusion
     )
 
 

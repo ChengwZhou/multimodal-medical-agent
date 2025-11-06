@@ -93,10 +93,6 @@ class MultimodalActivityTransformer(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, model_dim))
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
-        # History projection: history expected as [B, 1, 140] or [B, 140, 1]
-        # We will accept either shape, convert to [B, 140, 1] then project with this linear
-        self.history_proj = nn.Linear(1, model_dim, bias=True)  # maps per-token dim 1 -> model_dim
-
         # Cross-attention layers: fused (Q) attends to mem (K,V)
         self.cross_attn = CrossAttentionLayer(model_dim, nhead, dim_feedforward=ff_dim, dropout=dropout)
 
@@ -151,7 +147,7 @@ class MultimodalActivityTransformer(nn.Module):
         # optional modal dropout
         per_mod_tokens = self._maybe_modal_dropout(per_mod_tokens)
 
-        # concatenate tokens along time dimension -> [B, 14*10=140, 1]
+        # modal cross attention or concatenate tokens along time dimension -> [B, 14*10=140, 1]
         if self.modal_fusion == "cross_atten":
             concat_tokens = self.modal_cross_attn(per_mod_tokens, kv_masks=history_mask)
         else:

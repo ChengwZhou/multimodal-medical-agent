@@ -28,21 +28,22 @@ import json
 from collections import deque, defaultdict
 
 # Import base components
-from sequential_trainer import (
-    SequentialDataset,
-    SequentialBatch,
-    collate_sequential_batch,
-    setup_ddp,
-    cleanup_ddp,
-    log_info
-)
-
 from models.former_sensor import build_former
 from models.former_device import build_former_device
 from models.agent_sensor_masking import SensorGatingAgent
 from models.agent_device_masking import DeviceGatingAgent
 from models.FMformer import build_FMformer, ModalityConfig
 
+from sequential_trainer import (
+    setup_ddp,
+    cleanup_ddp,
+    log_info
+)
+from dataset.sequential_datset import (
+    SequentialDataset,
+    SequentialBatch,
+    collate_sequential_batch,
+)
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
 from dataset.mHEALTH_loader import MHealthDataset
 from utils.metrics import compute_metrics, print_metrics
@@ -209,7 +210,6 @@ class AgentSequentialTrainer:
             self.memory_bank = deque(maxlen=memory_bank_size)
             self.memory_bank_labels = deque(maxlen=memory_bank_size)
             self.memory_bank_modality = deque(maxlen=memory_bank_size)
-            # self.modalities_per_sensor = self._compute_modalities_per_sensor()
 
         # Predictive MLP for predictive coding loss
         if self.use_predictive_loss:
@@ -237,14 +237,6 @@ class AgentSequentialTrainer:
             log_info(f"Contrastive loss: {use_contrastive_loss}, weight: {contrastive_weight}, tau: {contrastive_tau}")
             log_info(
                 f"Predictive loss: {use_predictive_loss}, weight: {predictive_weight}, offset: {predictive_offset}")
-
-    def _compute_modalities_per_sensor(self) -> Dict[int, List[int]]:
-        """Group modality indices by device_idx."""
-        modalities = self.model.module.modalities if self.is_ddp else self.model.modalities
-        sensor_mods = defaultdict(list)
-        for idx, modality in enumerate(modalities):
-            sensor_mods[modality.device_idx].append(idx)
-        return sensor_mods
 
     def get_lr_schedulers(self, total_steps: int):
         """Get learning rate schedulers with warmup for model, agent, and predictive MLP"""
