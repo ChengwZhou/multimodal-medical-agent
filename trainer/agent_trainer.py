@@ -45,6 +45,7 @@ from models.FMformer import build_FMformer, ModalityConfig
 
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
 from dataset.mHEALTH_loader import MHealthDataset
+from dataset.WESAD_loader import MultiModalWESADDataset
 from utils.metrics import compute_metrics, print_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -906,12 +907,12 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=str, default="12355")
     parser.add_argument('--dataset', type=str, default='siscientisst')
     parser.add_argument('--root', type=str,
-                        default='/Users/chengweizhou/PycharmProjects/data/scientisst-move-annotated-wearable-multimodal-biosignals-recorded-during-everyday-life-activities-in-naturalistic-environments-1.0.1')
-    parser.add_argument('--model_lr', type=float, default=3e-4)
-    parser.add_argument('--agent_lr', type=float, default=3e-4)
+                        default='C:\Coding\Research\multimodal-medical-agent\dataset\mhealth+dataset')
+    parser.add_argument('--model_lr', type=float, default=5e-5)
+    parser.add_argument('--agent_lr', type=float, default=1e-3)
     parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--bptt_steps', type=int, default=10)
-    parser.add_argument('--num_epochs', type=int, default=100)
+    parser.add_argument('--num_epochs', type=int, default=10)
     parser.add_argument('--window_sec', type=float, default=1.0)
     parser.add_argument('--stride_sec', type=float, default=10)
     # Model Config
@@ -923,7 +924,7 @@ if __name__ == "__main__":
                         concatenation')
     # Loss Config
     parser.add_argument('--ce_weight', type=float, default=1.0)
-    parser.add_argument('--gating_weight', type=float, default=0.1)
+    parser.add_argument('--gating_weight', type=float, default=0.05)
     parser.add_argument('--mem_context_cache_length', type=float, default=10)
     # New arguments for contrastive and predictive losses
     parser.add_argument('--use_contrastive_loss', action='store_true')
@@ -983,6 +984,35 @@ if __name__ == "__main__":
                 ModalityConfig('al', 3, 10, 0), ModalityConfig('gl', 3, 10, 0),
                 ModalityConfig('ar', 3, 10, 1), ModalityConfig('gr', 3, 10, 1),
             ]
+    elif args.dataset == "wesad":
+        dataset = MultiModalWESADDataset(args.root, [2,3], window_sec=10, target_fs=64)
+        train_subjects = [2]
+        val_subjects = [3]
+        num_classes = 3
+        num_modal = 14
+        if not args.use_device_wise_model:
+            modalities = [
+                # RespiBAN chest sensor (device 0)
+                ModalityConfig('chest_acc', 3, 10, 0),
+                ModalityConfig('chest_ecg', 1, 10, 0),
+                ModalityConfig('chest_emg', 1, 10, 0),
+                ModalityConfig('chest_eda', 1, 10, 0),
+                ModalityConfig('chest_temp', 1, 10, 0),
+                ModalityConfig('chest_resp', 1, 10, 0),
+
+                # Empatica E4 wrist sensor (device 1)
+                ModalityConfig('wrist_acc', 3, 10, 1),
+                ModalityConfig('wrist_bvp', 1, 10, 1),
+                ModalityConfig('wrist_eda', 1, 10, 1),
+                ModalityConfig('wrist_temp', 1, 10, 1),
+            ]
+        else:
+            # Device-wise grouping (optional)
+            modalities = [
+                ModalityConfig('chest', 8, 10, 0),
+                ModalityConfig('wrist', 6, 10, 1),
+            ]
+
     if args.use_device_wise_model:
         model = build_former_device(num_classes=num_classes, model_dim=512, return_mem=True, modalities=modalities, modal_fusion=args.modal_fusion)
         agent = DeviceGatingAgent(num_modalities=num_modal, modalities=modalities, feature_dim=512)
