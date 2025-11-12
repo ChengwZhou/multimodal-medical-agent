@@ -32,10 +32,12 @@ import time
 import argparse
 from models.former_sensor import build_former
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
+from dataset.hmc_loader import HMCSleepDataset
+from dataset.WESAD_loader import MultiModalWESADDataset
 from utils.metrics import compute_metrics, print_metrics
 
 
-from dataset.sequential_datset import (
+from dataset.sequential_dataset import (
     SequentialDataset,
     SequentialBatch,
     collate_sequential_batch,

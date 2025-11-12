@@ -29,7 +29,7 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :L]
 
 
-# class AdaptivetiveSensingModule(nn.Module):
+# class AdaptiveSensingModule(nn.Module):
 #     """
 #     Adaptive sensing module with learnable threshold for each modality.
 #     When |delta_input| < threshold, the sensor is turned off for skip_steps.
@@ -78,48 +78,39 @@ class PositionalEncoding(nn.Module):
 #         else:
 #             return self.skip_steps
 #
-#     def forward(self, delta_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-#         """
-#         Apply adaptive sensing mask to delta input.
-#         When timesteps are masked, the next active delta accumulates all skipped deltas.
-#
-#         Args:
-#             delta_input: [B, 1, T] - delta values: x0, x1-x0, x2-x1, ...
-#
-#         Returns:
-#             masked_input: [B, 1, T] - adjusted delta input (aggregated over masked periods)
-#             mask: [B, 1, T] - binary mask (1=active, 0=masked/sensor off)
-#         """
+#     def forward(self, delta_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 #         B, C, T = delta_input.shape
 #         assert C == 1
-#         x = delta_input.squeeze(1)  # [B, T]
+#         x = delta_input.squeeze(1)  # [B, T] ← delta = xt - x{t-1}
 #
 #         threshold = self.get_threshold()
 #         skip_steps = self.get_skip_steps()
 #
 #         # Initialize per-batch state
-#         timer = torch.zeros(B, dtype=torch.long, device=x.device)  # skip remaining
-#         accum = torch.zeros(B, dtype=x.dtype, device=x.device)  # accumulated delta
+#         timer = torch.zeros(B, dtype=torch.long, device=x.device)  # 剩余关闭步数
 #         mask = torch.zeros_like(x)
-#         masked = torch.zeros_like(x)
+#         masked = torch.zeros_like(x)  # ← 输出 masked delta
 #
 #         for t in range(T):
-#             curr = x[:, t]
-#             is_on = timer <= 0
-#             adj = curr + accum
+#             curr = x[:, t]  # 当前 delta
+#             is_on = timer <= 0  # 是否可以采样
 #
-#             trigger_off = is_on & (torch.abs(adj) < threshold)
+#             # === 关键：用 |curr| 判断是否触发关闭 ===
+#             trigger_off = is_on & (torch.abs(curr) < threshold)
+#             # update timer
+#             timer = torch.where(
+#                 trigger_off,
+#                 torch.full_like(timer, skip_steps),  # 触发 → 关闭 skip_steps
+#                 torch.clamp(timer - 1, min=0)  # 否则倒计时
+#             )
+#             # decide to active
+#             active = is_on & ~trigger_off
+#             mask[:, t] = active.float()
 #
-#             # Update state
-#             timer = torch.where(trigger_off, torch.full_like(timer, skip_steps), torch.clamp(timer - 1, min=0))
-#             mask[:, t] = (is_on & ~trigger_off).float()
-#             masked[:, t] = torch.where(is_on & ~trigger_off, adj, torch.zeros_like(curr))
+#             masked[:, t] = torch.where(active, curr, torch.zeros_like(curr))
 #
-#             # Update accumulation
-#             accum = torch.where(is_on & ~trigger_off, torch.zeros_like(accum), accum + curr)
-#             accum = torch.where(trigger_off, adj, accum)
-#
-#         return masked.unsqueeze(1), mask.unsqueeze(1)
+#         active_ratio = mask.float().mean()
+#         return masked.unsqueeze(1), mask.unsqueeze(1), active_ratio
 
 
 class AdaptiveSensingModule(nn.Module):
@@ -132,7 +123,7 @@ class AdaptiveSensingModule(nn.Module):
                  skip_steps: int = 5,
                  learnable_skip: bool = False,
                  min_threshold: float = 0.01,
-                 max_threshold: float = 1.0):
+                 max_threshold: float = 5):
         super().__init__()
         self.log_threshold = nn.Parameter(torch.tensor(math.log(init_threshold)))
         self.min_threshold = min_threshold
@@ -160,89 +151,61 @@ class AdaptiveSensingModule(nn.Module):
             return int(torch.round(s).item())
         return self.skip_steps
 
-    # --------------------------------------------------------------------- #
-    #  完全向量化 forward
-    # --------------------------------------------------------------------- #
-    def forward(self, delta_input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            delta_input: [B, 1, T]  (differenced signal)
-
-        Returns:
-            masked_input: [B, 1, T]  (adjusted delta, zero where sensor OFF)
-            mask:         [B, 1, T]  (1 = active, 0 = OFF)
-        """
+    def forward(self, delta_input: torch.Tensor):
         B, C, T = delta_input.shape
-        assert C == 1, "Expected single channel input"
-        x = delta_input.squeeze(1)                     # [B, T]
+        assert C == 1
+        x = delta_input.squeeze(1)  # [B, T]
 
-        threshold = self.get_threshold()               # scalar
-        skip_steps = self.get_skip_steps()             # int
-        device = x.device
+        th = self.get_threshold()
+        skip = self.get_skip_steps()
 
-        # --------------------------------------------------------------- #
-        # 1. 构建时间索引
-        # --------------------------------------------------------------- #
-        t_idx = torch.arange(T, device=device).unsqueeze(0).expand(B, T)   # [B, T]
+        # 1. 计算软权重（用于梯度）
+        abs_x = torch.abs(x)
+        # 使用 sigmoid 让阈值附近有平滑的梯度
+        soft_weight = torch.sigmoid((abs_x - th) / (th * 0.1))  # 0.1 是温度参数
 
-        # --------------------------------------------------------------- #
-        # 2. 累计 delta（在 sensor OFF 时累积）
-        #    这里我们先算出 **所有可能的累计值**，后面再 mask
-        # --------------------------------------------------------------- #
-        # 为了得到真正的 accum，需要知道 sensor 在何时 OFF。
-        # 我们先假设所有位置都是 OFF，累计全部 delta → cum_x
-        cum_x = torch.cumsum(x, dim=1)                 # [B, T]
+        # 2. 计算硬触发（用于前向传播）
+        trigger = abs_x < th
 
-        # --------------------------------------------------------------- #
-        # 3. 构造 “潜在触发点” （如果 sensor ON 且 |adj| < th）
-        #    这里的 adj = x + accum_prev
-        #    我们用 “上一次活跃的累计” 近似（后面会修正）
-        # --------------------------------------------------------------- #
-        # 先算一个 **粗糙的 adj**：使用上一步的累计（左移一位）
-        adj_approx = x + torch.cat([torch.zeros(B, 1, device=device),
-                                   cum_x[:, :-1]], dim=1)   # [B, T]
+        # 3. 传播 skip_end
+        t = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
+        skip_end = torch.where(trigger, t + skip, torch.full_like(t, -1))
+        skip_end = torch.cummax(skip_end, dim=1).values
 
-        # 潜在触发：sensor 必须 ON（timer[t-1]==0）且 |adj| < th
-        potential_trigger = torch.abs(adj_approx) < threshold   # [B, T]
-        # 4. 用 **cummax** 传播最近一次触发点 → skip_end
-        # 把触发点映射为 “skip 结束时间” = t + skip_steps
-        skip_end_candidate = torch.where(
-            potential_trigger,
-            t_idx + skip_steps,                         # 触发 → skip 到 t+skip_steps
-            torch.full_like(t_idx, -1)                  # 不触发 → 无效
-        )                                                # [B, T]
-        # 因果 cummax：每个位置保留 **最近一次** 有效的 skip_end
-        # (从左到右传播，-1 会被后面的有效值覆盖)
-        skip_end = torch.cummax(skip_end_candidate, dim=1).values   # [B, T]
-        # 5. 计算真实的 **timer**（剩余 skip 步数）
-        timer = torch.clamp(skip_end - t_idx, min=0)                # [B, T]
-        # 6. 真正的 **active** 位置：timer[t] == 0
-        active = timer == 0                                         # [B, T]
-        # 7. 真正的 **adjusted delta**（使用真实的累计） 累计只在 sensor OFF 时累加 → 只在 non-active 位置累加 构造 “是否在 OFF 期间” 的 mask
-        off_mask = ~active                                           # [B, T]
+        # 4. 硬激活
+        timer = torch.clamp(skip_end - t, min=0)
+        active_hard = (timer == 0).float()
 
-        # OFF 期间的累计增量 = x[t] （只在 OFF 时加）
-        delta_off = x * off_mask.float()
+        # 5. Straight-Through Estimator
+        active = active_hard + soft_weight - soft_weight.detach()
 
-        # 前缀和得到 OFF 期间累计的总和
-        accum_off = torch.cumsum(delta_off, dim=1)                   # [B, T]
+        # 6. 应用 mask
+        masked_delta = x * active
 
-        # 真正的 adj = x + 上一时刻的累计（在 OFF 期间累计的）
-        # 上一时刻累计 = accum_off[t-1]（左移）
-        accum_prev = torch.cat([torch.zeros(B, 1, device=device),
-                               accum_off[:, :-1]], dim=1)           # [B, T]
+        mask = active_hard
+        active_ratio = mask.mean()
 
-        adj = x + accum_prev                                        # [B, T]
+        return masked_delta.unsqueeze(1), mask.unsqueeze(1), active_ratio
 
-        # --------------------------------------------------------------- #
-        # 8. 最终 mask & masked_input
-        # --------------------------------------------------------------- #
-        # 只有 active 位置才输出 adj，其余为 0
-        masked = adj * active.float()                               # [B, T]
-        mask   = active.float()                                     # [B, T]
-
-        # 恢复通道维度
-        return masked.unsqueeze(1), mask.unsqueeze(1)
+        # B, C, T = delta_input.shape
+        # assert C == 1
+        # x = delta_input.squeeze(1)
+        #
+        # th = self.get_threshold()
+        # skip = self.get_skip_steps()
+        #
+        # trigger = torch.abs(x) < th
+        # t = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
+        # skip_end = torch.where(trigger, t + skip, torch.full_like(t, -1))
+        # skip_end = torch.cummax(skip_end, dim=1).values
+        # timer = torch.clamp(skip_end - t, min=0)
+        # active = timer == 0
+        #
+        # masked_delta = x * active.float()  # ← 仍是 delta！
+        # mask = active.float()
+        # active_ratio = mask.mean()
+        #
+        # return masked_delta.unsqueeze(1), mask.unsqueeze(1), active_ratio
 
 
 class ConvTokenizer1D(nn.Module):
@@ -416,9 +379,10 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
         for i, m in enumerate(self.modalities):
             # Extract channel
             ch = x[:, i:i+m.in_ch, :]  # [B, m, T]
+            # print(f"m{i}: {ch[0][0][:10]}")
 
             # Apply adaptive sensing
-            masked_ch, mask = self.adaptive_sensing[m.name](ch)  # [B, 1, T], [B, 1, T]
+            masked_ch, mask, active_ratio = self.adaptive_sensing[m.name](ch)  # [B, 1, T], [B, 1, T]
 
             # Store sensing info
             if self.return_sensing_info:
@@ -526,7 +490,7 @@ if __name__ == "__main__":
         num_classes=12,
         model_dim=32,
         return_mem=True,
-        init_threshold=0.1,
+        init_threshold=0.4,
         skip_steps=5,
         learnable_skip=False,
         return_sensing_info=True
@@ -547,7 +511,7 @@ if __name__ == "__main__":
         num_classes=12,
         model_dim=32,
         return_mem=False,
-        init_threshold=0.15,
+        init_threshold=0.1,
         skip_steps=3,
         learnable_skip=True,
         return_sensing_info=True

@@ -17,37 +17,36 @@ class DeltaDataset(Dataset):
 
     def apply_differencing(self, x: np.ndarray) -> np.ndarray:
         """
-        Apply differencing to signal along specified axis.
-        For 1D: [t0, t1-t0, t2-t1, t3-t2, ...]
-        For multi-channel (e.g., [C, T]): applies independently to each channel.
-        First value remains unchanged, subsequent values are differences.
+        Apply differencing along the specified axis.
+        The output has the same shape as input, with:
+        - First element: original value x[0]
+        - Subsequent elements: differences x[t] - x[t-1]
 
-        Args:
-            x: Input signal array, can be 1D [T] or multi-dim e.g. [C, T]
-
-        Returns:
-            Differenced signal of same shape as input
+        This ensures cumsum(output) recovers the original signal.
         """
         if x.shape[self.axis] <= 1:
             return x.copy()
 
-        # Create slices for diff
-        slices_prev = [slice(None)] * x.ndim
-        slices_prev[self.axis] = slice(None, -1)
-        slices_curr = [slice(None)] * x.ndim
-        slices_curr[self.axis] = slice(1, None)
+        # Normalize axis to positive index
+        axis = self.axis if self.axis >= 0 else x.ndim + self.axis
 
-        # Compute differences
-        diff_x = np.zeros_like(x)
-        diff_x[tuple(slices_prev)] = x[tuple(slices_prev)]  # Copy all previous values
-        diff_x[tuple(slices_curr)] = x[tuple(slices_curr)] - x[tuple(slices_prev)]  # Compute differences
+        # Compute differences: x[t] - x[t-1] for t >= 1
+        # np.diff returns shape [..., T-1, ...]
+        diff = np.diff(x, axis=axis)
 
-        # Correct: set first slice to original first values
-        slices_first = [slice(None)] * x.ndim
-        slices_first[self.axis] = slice(0, 1)
-        diff_x[tuple(slices_first)] = x[tuple(slices_first)]
+        # Get the first element along the axis
+        # We'll keep this as the first element in output
+        first = np.take(x, indices=[0], axis=axis)  # shape: [..., 1, ...]
 
-        return diff_x
+        # Concatenate [first, diff] along the axis
+        # This gives us: [x[0], x[1]-x[0], x[2]-x[1], ..., x[T-1]-x[T-2]]
+        delta_x = np.concatenate([first, diff], axis=axis)
+
+        # Verify the shape is preserved
+        assert delta_x.shape == x.shape, \
+            f"Shape mismatch: input {x.shape} vs output {delta_x.shape}"
+
+        return delta_x
 
     def __len__(self):
         return len(self.base_dataset)
@@ -70,4 +69,17 @@ class DeltaDataset(Dataset):
         """Delegate attribute access to the base dataset."""
         return getattr(self.base_dataset, name)
 
+    def get_subject_sequence(self, subject_id: int):
+        if not hasattr(self.base_dataset, 'get_subject_sequence'):
+            raise AttributeError("base_dataset has no get_subject_sequence")
 
+        raw_seq = self.base_dataset.get_subject_sequence(subject_id)
+        diff_seq = []
+        for x, y in raw_seq:
+            # print(x[0][:10])
+            x_np = x.numpy() if isinstance(x, torch.Tensor) else np.array(x)
+            x_diff = self.apply_differencing(x_np)
+            x_diff = torch.from_numpy(x_diff).float()
+            diff_seq.append((x_diff, int(y)))
+            # print(x_diff[0][:10])
+        return diff_seq

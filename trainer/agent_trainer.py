@@ -39,13 +39,16 @@ from sequential_trainer import (
     cleanup_ddp,
     log_info
 )
-from dataset.sequential_datset import (
+from dataset.sequential_dataset import (
     SequentialDataset,
     SequentialBatch,
     collate_sequential_batch,
+    collate_sequential_batch_sync
 )
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
 from dataset.mHEALTH_loader import MHealthDataset
+from dataset.hmc_loader import HMCSleepDataset
+from dataset.WESAD_loader import MultiModalWESADDataset
 from utils.metrics import compute_metrics, print_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -64,6 +67,7 @@ class AgentSequentialTrainer:
             agent: SensorGatingAgent,
             train_dataset: SequentialDataset,
             val_dataset: Optional[SequentialDataset] = None,
+            only_predictive: bool = False,
             batch_size: int = 8,
             learning_rate: float = 1e-3,
             agent_learning_rate: float = 1e-3,
@@ -96,6 +100,8 @@ class AgentSequentialTrainer:
     ):
         self.model = model
         self.agent = agent
+        self.only_predictive = only_predictive
+
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.batch_size = batch_size
@@ -169,15 +175,23 @@ class AgentSequentialTrainer:
             train_sampler = None
             val_sampler = None
 
+        max_len = train_dataset.max_length
+        if self.is_ddp:
+            max_tensor = torch.tensor([max_len], device=self.device)
+            dist.all_reduce(max_tensor, op=dist.ReduceOp.MIN)
+            max_len = max_tensor.item()
+        self.max_len = max_len
+        # print(self.max_len)
+
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=(train_sampler is None),
             sampler=train_sampler,
-            collate_fn=collate_sequential_batch,
+            collate_fn=lambda batch: collate_sequential_batch_sync(batch, max_len),  #
             num_workers=1,
-            pin_memory=True,
-            persistent_workers=True
+            pin_memory=False,
+            persistent_workers=True,
         )
 
         if val_dataset:
@@ -186,9 +200,9 @@ class AgentSequentialTrainer:
                 batch_size=batch_size,
                 shuffle=False,
                 sampler=val_sampler,
-                collate_fn=collate_sequential_batch,
+                collate_fn=lambda batch: collate_sequential_batch_sync(batch, max_len),
                 num_workers=1,
-                pin_memory=True,
+                pin_memory=False,
                 persistent_workers=True
             )
 
@@ -349,6 +363,8 @@ class AgentSequentialTrainer:
         seq_lengths = batch.seq_lengths.to(self.device)  # [B]
 
         B, max_seq_len, C, T = sequences.shape
+
+        # print(max_seq_len, self.device)
         M = self.agent.module.num_modalities if self.is_ddp else self.agent.num_modalities
         if args.use_device_wise_model:
             num_features = self.agent.module.num_device if self.is_ddp else self.agent.num_device
@@ -380,6 +396,9 @@ class AgentSequentialTrainer:
             start_idx = chunk_idx * self.bptt_steps
             end_idx = min(start_idx + self.bptt_steps, max_seq_len)
             chunk_size = end_idx - start_idx
+            # print("chunk_size",  chunk_size)
+            if chunk_size <= 1:
+                continue
 
             # Zero gradients at start of each BPTT chunk
             self.model_optimizer.zero_grad(set_to_none=True)
@@ -405,8 +424,8 @@ class AgentSequentialTrainer:
                 label = labels[:, i]  # [B]
                 mask = label != -100
 
-                if not mask.any():
-                    continue
+                # if not mask.any():
+                #     continue
 
                 # If we have memory from previous window, use agent to get gating
                 if mem is not None and i > start_idx:
@@ -429,7 +448,10 @@ class AgentSequentialTrainer:
                     p_st_expanded = p_st_expanded.repeat(1, 1, channels_per_modality, T)  # [B, M, channels_per_mod, T]
                     p_st_expanded = p_st_expanded.view(B, C, T)  # [B, C, T]
 
-                    window_masked = window * p_st_expanded
+                    if not self.only_predictive:
+                        window_masked = window * p_st_expanded
+                    else:
+                        window_masked = window
 
                     # Update sensor history
                     sensor_history = torch.cat([
@@ -471,6 +493,8 @@ class AgentSequentialTrainer:
                             correct_count += correct
                             chunk_samples += mask.sum().item()
                             total_samples += mask.sum().item()
+                    else:
+                        pass
 
                     # Add gating loss if we used the agent
                     if p_soft is not None:
@@ -499,7 +523,7 @@ class AgentSequentialTrainer:
                             predictive_loss = self.compute_predictive_loss(emb_t, emb_t_plus_delta)
                             chunk_predictive_loss += predictive_loss
 
-            # Backward pass for this chunk
+            # Backward pass for this chunk (ONLY if we have valid samples)
             if chunk_samples > 0:
                 # Combine losses
                 chunk_total_loss = (
@@ -508,51 +532,63 @@ class AgentSequentialTrainer:
                         self.contrastive_weight * chunk_contrastive_loss +
                         self.predictive_weight * chunk_predictive_loss
                 )
+            else:
+                chunk_total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
-                # Scale and backward
-                self.scaler.scale(chunk_total_loss).backward()
+            # print("111111", self.device, chunk_idx, num_chunks, chunk_samples)
+            # Scale and backward
+            self.scaler.scale(chunk_total_loss).backward()
 
-                # Accumulate metrics
-                total_ce_loss += chunk_ce_loss.item() if isinstance(chunk_ce_loss, torch.Tensor) else chunk_ce_loss
-                total_gating_loss += chunk_gating_loss.item() if isinstance(chunk_gating_loss,
-                                                                            torch.Tensor) else chunk_gating_loss
-                total_contrastive_loss += chunk_contrastive_loss.item() if isinstance(chunk_contrastive_loss,
-                                                                                      torch.Tensor) else chunk_contrastive_loss
-                total_predictive_loss += chunk_predictive_loss.item() if isinstance(chunk_predictive_loss,
-                                                                                    torch.Tensor) else chunk_predictive_loss
-                total_loss += chunk_total_loss.item()
+            # print("111112", self.device, chunk_idx, num_chunks, chunk_samples)
+
+            # Unscale gradients for clipping
+            self.scaler.unscale_(self.model_optimizer)
+            self.scaler.unscale_(self.agent_optimizer)
+            if self.use_predictive_loss:
+                self.scaler.unscale_(self.predictive_optimizer)
+
+            # Gradient clipping
+            if self.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(self.agent.parameters(), self.grad_clip_norm)
+                if self.use_predictive_loss:
+                    torch.nn.utils.clip_grad_norm_(self.predictive_mlp.parameters(), self.grad_clip_norm)
+
+            # print("111113", self.device, chunk_idx, num_chunks, chunk_samples)
+
+            # Optimizer steps
+            self.scaler.step(self.model_optimizer)
+            # print("111115", self.device, chunk_idx, num_chunks, chunk_samples)
+            self.scaler.step(self.agent_optimizer)
+            if self.use_predictive_loss:
+                self.scaler.step(self.predictive_optimizer)
+
+            # Update scaler
+            self.scaler.update()
+
+
+            # Learning rate scheduler steps
+            if hasattr(self, 'schedulers'):
+                self.schedulers["model"].step()
+                self.schedulers["agent"].step()
+                if self.use_predictive_loss:
+                    self.schedulers["predictive"].step()
+
+            # Accumulate metrics
+            total_ce_loss += chunk_ce_loss.item() if isinstance(chunk_ce_loss,
+                                                                torch.Tensor) else chunk_ce_loss
+            total_gating_loss += chunk_gating_loss.item() if isinstance(chunk_gating_loss,
+                                                                        torch.Tensor) else chunk_gating_loss
+            total_contrastive_loss += chunk_contrastive_loss.item() if isinstance(chunk_contrastive_loss,
+                                                                                  torch.Tensor) else chunk_contrastive_loss
+            total_predictive_loss += chunk_predictive_loss.item() if isinstance(chunk_predictive_loss,
+                                                                                torch.Tensor) else chunk_predictive_loss
+            total_loss += chunk_total_loss.item()
 
             # Detach memory for next chunk
             if chunk_mems:
                 mem = chunk_mems[-1].detach() if chunk_mems[-1] is not None else None
 
-            # Gradient clipping and optimization
-            if chunk_samples > 0:
-                # Unscale gradients
-                self.scaler.unscale_(self.model_optimizer)
-                self.scaler.unscale_(self.agent_optimizer)
-                if self.use_predictive_loss:
-                    self.scaler.unscale_(self.predictive_optimizer)
-
-                # Gradient clipping
-                if self.grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
-                    torch.nn.utils.clip_grad_norm_(self.agent.parameters(), self.grad_clip_norm)
-                    if self.use_predictive_loss:
-                        torch.nn.utils.clip_grad_norm_(self.predictive_mlp.parameters(), self.grad_clip_norm)
-
-                # Optimizer steps
-                self.scaler.step(self.model_optimizer)
-                self.scaler.step(self.agent_optimizer)
-                if self.use_predictive_loss:
-                    self.scaler.step(self.predictive_optimizer)
-                self.scaler.update()
-
-                if hasattr(self, 'schedulers'):
-                    self.schedulers["model"].step()
-                    self.schedulers["agent"].step()
-                    if self.use_predictive_loss:
-                        self.schedulers["predictive"].step()
 
         # Compute average metrics
         avg_ce_loss = total_ce_loss / num_chunks if num_chunks > 0 else 0.0
@@ -579,7 +615,7 @@ class AgentSequentialTrainer:
 
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
-        """Validation loop with agent gating"""
+        """Validation loop with agent gating - support single GPU & DDP"""
         if not self.val_dataset:
             return {}
 
@@ -597,6 +633,9 @@ class AgentSequentialTrainer:
 
         all_preds = []
         all_labels = []
+
+        # 是否使用 DistributedSampler（关键！）
+        use_distributed_sampler = self.is_ddp and hasattr(self.val_loader.sampler, 'set_epoch')
 
         for batch in tqdm(self.val_loader, desc="Validation", leave=False, disable=not self.is_main_process):
             sequences = batch.sequences.to(self.device)
@@ -628,19 +667,20 @@ class AgentSequentialTrainer:
                         agent_output = self.agent(
                             represent_features=mem,
                             sensor_history=sensor_history,
-                            use_straight_through=False  # Use soft gating in validation
+                            use_straight_through=False
                         )
-
                     p_soft = agent_output['p_soft']
 
-                    # Apply soft gating
                     channels_per_modality = C // M
                     p_soft_expanded = p_soft.unsqueeze(-1).unsqueeze(-1)
                     p_soft_expanded = p_soft_expanded.repeat(1, 1, channels_per_modality, T)
                     p_soft_expanded = p_soft_expanded.view(B, C, T)
-                    window_masked = window * p_soft_expanded
 
-                    # Update history
+                    if not self.only_predictive:
+                        window_masked = window * p_soft_expanded
+                    else:
+                        window_masked = window
+
                     sensor_history = torch.cat([
                         sensor_history[:, 1:, :],
                         torch.round(p_soft).unsqueeze(1)
@@ -675,43 +715,74 @@ class AgentSequentialTrainer:
 
                         all_preds.append(preds.cpu())
                         all_labels.append(label[mask].cpu())
-                        # print(preds.shape, label[mask].shape)
 
-        all_preds = torch.cat(all_preds)
-        all_labels = torch.cat(all_labels)
+        # ========== 关键：智能合并预测结果 ==========
+        if all_preds:
+            all_preds = torch.cat(all_preds)  # [N_local]
+            all_labels = torch.cat(all_labels)  # [N_local]
+        else:
+            all_preds = torch.tensor([], dtype=torch.long, device='cpu')
+            all_labels = torch.tensor([], dtype=torch.long, device='cpu')
 
-        # Synchronize across processes if DDP
+        # ---------- DDP 模式：同步 ----------
         if self.is_ddp:
+            # 1. 同步标量指标
             metrics_tensor = torch.tensor(
                 [total_ce_loss, correct_count, total_samples, total_sensor_usage, sensor_usage_counts],
-                device=self.device
+                dtype=torch.float64, device=self.device
             )
             dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
             total_ce_loss, correct_count, total_samples, total_sensor_usage, sensor_usage_counts = metrics_tensor.tolist()
 
-            all_preds_list = [torch.zeros_like(all_preds) for _ in range(self.world_size)]
-            all_labels_list = [torch.zeros_like(all_labels) for _ in range(self.world_size)]
-            torch.distributed.all_gather(all_preds_list, all_preds.to(self.device))
-            torch.distributed.all_gather(all_labels_list, all_labels.to(self.device))
-            all_preds = torch.cat(all_preds_list).numpy()
-            all_labels = torch.cat(all_labels_list).numpy()
+            # 2. 同步预测结果（设备安全版）
+            if all_preds.numel() > 0:
+                # 预分配输出 list（每个都在当前 GPU）
+                pred_list = [torch.zeros_like(all_preds, device=self.device) for _ in range(self.world_size)]
+                label_list = [torch.zeros_like(all_labels, device=self.device) for _ in range(self.world_size)]
 
-        if total_samples == 0:
-            return {"val_loss": 0.0, "val_accuracy": 0.0, "val_sensor_usage": 1.0}
+                dist.all_gather(pred_list, all_preds.to(self.device))
+                dist.all_gather(label_list, all_labels.to(self.device))
 
-        metrics = compute_metrics(all_labels, all_preds, average='macro')
-        print_metrics(metrics)
+                all_preds = torch.cat(pred_list).cpu().numpy()
+                all_labels = torch.cat(label_list).cpu().numpy()
+            else:
+                # 空预测：广播一个空 tensor
+                empty_pred = torch.tensor([], dtype=torch.long, device=self.device)
+                empty_label = torch.tensor([], dtype=torch.long, device=self.device)
+                pred_list = [torch.zeros_like(empty_pred) for _ in range(self.world_size)]
+                label_list = [torch.zeros_like(empty_label) for _ in range(self.world_size)]
+                dist.all_gather(pred_list, empty_pred)
+                dist.all_gather(label_list, empty_label)
+                all_preds = np.array([])
+                all_labels = np.array([])
 
-        avg_loss = total_ce_loss / total_samples
-        avg_sensor_usage = total_sensor_usage / max(sensor_usage_counts, 1)
+        else:
+            # ---------- 单卡模式：直接转 CPU ----------
+            if all_preds.numel() > 0:
+                all_preds = all_preds.cpu().numpy()
+                all_labels = all_labels.cpu().numpy()
+            else:
+                all_preds = np.array([])
+                all_labels = np.array([])
 
-        return {
-            "val_loss": round(avg_loss, 4),
-            "val_sensor_usage": round(avg_sensor_usage, 4),
-            "val_accuracy": round(metrics['accuracy'], 4),
-            # "val_f1-score": round(metrics['f1_score'], 4),
-            # "Confusion Matrix": metrics["confusion_matrix"]
-        }
+        # ========== 计算指标（仅主进程）==========
+        if self.is_main_process:
+            if total_samples == 0:
+                return {"val_loss": 0.0, "val_accuracy": 0.0, "val_sensor_usage": 1.0}
+
+            metrics = compute_metrics(all_labels, all_preds, use_weighted=True)
+            print_metrics(metrics)
+
+            avg_loss = total_ce_loss / total_samples
+            avg_sensor_usage = total_sensor_usage / max(sensor_usage_counts, 1)
+
+            return {
+                "val_loss": round(avg_loss, 4),
+                "val_sensor_usage": round(avg_sensor_usage, 4),
+                "val_accuracy": round(metrics['accuracy'], 4),
+            }
+        else:
+            return {}
 
     def train(self, num_epochs: int = 10):
         """Main training loop with BPTT"""
@@ -751,17 +822,20 @@ class AgentSequentialTrainer:
                     epoch_predictive_losses.append(metrics["predictive_loss"])
 
                     if self.is_main_process and batch_idx % self.log_interval == 0:
-                        log_info(f"Step {batch_idx}: loss={metrics['loss']:.4f}, "
-                                 f"ce_loss={metrics['ce_loss']:.4f}, "
-                                 f"gating_loss={metrics['gating_loss']:.4f}, "
-                                 f"contrastive_loss={metrics['contrastive_loss']:.4f}, "
-                                 f"predictive_loss={metrics['predictive_loss']:.4f}, "
-                                 f"acc={metrics['accuracy']:.4f}, "
-                                 f"sensor_usage={metrics['sensor_usage']:.3f}, "
-                                 f"m_lr={metrics['model_lr']:.2e}, "
-                                 f"a_lr={metrics['agent_lr']:.2e}, "
-                                 f"p_lr={metrics['predictive_lr']:.2e}" if self.use_predictive_loss else ""
-                        )
+                        log_msg = f"Step {batch_idx}: loss={metrics['loss']:.4f}, " \
+                                  f"ce_loss={metrics['ce_loss']:.4f}, " \
+                                  f"gating_loss={metrics['gating_loss']:.4f}, " \
+                                  f"contrastive_loss={metrics['contrastive_loss']:.4f}, " \
+                                  f"predictive_loss={metrics['predictive_loss']:.4f}, " \
+                                  f"acc={metrics['accuracy']:.4f}, " \
+                                  f"sensor_usage={metrics['sensor_usage']:.3f}, " \
+                                  f"m_lr={metrics['model_lr']:.2e}, " \
+                                  f"a_lr={metrics['agent_lr']:.2e}"
+
+                        if self.use_predictive_loss:
+                            log_msg += f", p_lr={metrics['predictive_lr']:.2e}"
+
+                        log_info(log_msg)
 
             if epoch_losses and self.is_main_process:
                 epoch_time = time.time() - epoch_start_time
@@ -907,6 +981,7 @@ if __name__ == "__main__":
     parser.add_argument('--window_sec', type=float, default=1.0)
     parser.add_argument('--stride_sec', type=float, default=10)
     # Model Config
+    parser.add_argument('--only_predictive', action='store_true')
     parser.add_argument('--use_device_wise_model', action='store_true', help='use device embedded tokenizer based \
                         Transformer model(embeddings are not embeded in sensor-wise)')
     parser.add_argument('--use_fm_mdoel', action='store_true', help='use foundation model, can not setup fm model while\
@@ -975,6 +1050,78 @@ if __name__ == "__main__":
                 ModalityConfig('al', 3, 10, 0), ModalityConfig('gl', 3, 10, 0),
                 ModalityConfig('ar', 3, 10, 1), ModalityConfig('gr', 3, 10, 1),
             ]
+    elif args.dataset == "hmc":
+        global_stats = {"mean": np.array([9.1890168e-01, 1.9557451e+00, 2.4014959e+00, 1.6120193e+00,
+                        7.8689933e-05, 1.9333732e+00, 3.5932889e+00, 2.4175742e+00]),
+                        "std": np.array([ 40.361404, 25.491713, 28.026707, 35.241245, 3.7148967,
+                        30.820967, 41.629414, 124.64315])}
+
+        # Final: {0: 23686, 1: 15548, 2: 50083, 3: 26671, 4: 21255} | Total: 137243
+        dataset = HMCSleepDataset(
+            data_root=data_root,
+            subjects=None,
+            balance=False,
+            remove_wake=False,
+            apply_notch=True, notch_freq=50.0,
+            apply_emg_hp=True,
+            apply_ecg_filter=False,
+            global_stats=global_stats
+        )  # 30s-windows
+        train_ratio = 0.8
+        all_subjects = dataset.subjects
+
+        np.random.seed(42)
+        np.random.shuffle(all_subjects)
+
+        split_idx = int(len(all_subjects) * train_ratio)
+        train_subjects = sorted(all_subjects[:split_idx])
+        val_subjects = sorted(all_subjects[split_idx:])
+
+        num_classes = 5
+        weights = torch.tensor([1.1, 1.5, 0.5, 1, 1.25])
+        weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
+        num_modal = 8
+        # if not args.use_device_wise_model:
+        #     modalities = [
+        #         ModalityConfig(f'm{i}', 1, 10, 0) for i in range(num_modal)
+        #     ]
+        # else:
+        #     modalities = [
+        #         ModalityConfig('al', 3, 10, 0), ModalityConfig('gl', 3, 10, 0),
+        #         ModalityConfig('ar', 3, 10, 1), ModalityConfig('gr', 3, 10, 1),
+        #     ]
+        modalities = [
+            ModalityConfig(f'm{i}', 1, 30, 0) for i in range(num_modal)
+        ]
+    elif args.dataset == "wesad":
+        dataset = MultiModalWESADDataset(args.root, [2,3], window_sec=10, target_fs=64)
+        train_subjects = [2]
+        val_subjects = [3]
+        num_classes = 3
+        num_modal = 14
+        if not args.use_device_wise_model:
+            modalities = [
+                # RespiBAN chest sensor (device 0)
+                ModalityConfig('chest_acc', 3, 10, 0),
+                ModalityConfig('chest_ecg', 1, 10, 0),
+                ModalityConfig('chest_emg', 1, 10, 0),
+                ModalityConfig('chest_eda', 1, 10, 0),
+                ModalityConfig('chest_temp', 1, 10, 0),
+                ModalityConfig('chest_resp', 1, 10, 0),
+
+                # Empatica E4 wrist sensor (device 1)
+                ModalityConfig('wrist_acc', 3, 10, 1),
+                ModalityConfig('wrist_bvp', 1, 10, 1),
+                ModalityConfig('wrist_eda', 1, 10, 1),
+                ModalityConfig('wrist_temp', 1, 10, 1),
+            ]
+        else:
+            # Device-wise grouping (optional)
+            modalities = [
+                ModalityConfig('chest', 8, 10, 0),
+                ModalityConfig('wrist', 6, 10, 1),
+            ]
+
     if args.use_device_wise_model:
         model = build_former_device(num_classes=num_classes, model_dim=512, return_mem=True, modalities=modalities, modal_fusion=args.modal_fusion)
         agent = DeviceGatingAgent(num_modalities=num_modal, modalities=modalities, feature_dim=512)
@@ -1016,7 +1163,8 @@ if __name__ == "__main__":
             "memory_bank_size": args.memory_bank_size,
             "use_predictive_loss": args.use_predictive_loss,
             "predictive_weight": args.predictive_weight,
-            "predictive_offset": args.predictive_offset
+            "predictive_offset": args.predictive_offset,
+            "only_predictive": args.only_predictive
         },
         ddp_config=ddp_config
     )

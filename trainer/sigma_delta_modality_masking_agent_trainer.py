@@ -41,7 +41,7 @@ from sequential_trainer import (
     cleanup_ddp,
     log_info
 )
-from dataset.sequential_datset import (
+from dataset.sequential_dataset import (
     SequentialDataset,
     SequentialBatch,
     collate_sequential_batch,
@@ -49,6 +49,9 @@ from dataset.sequential_datset import (
 from dataset.delta_dataset import DeltaDataset
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
 from dataset.mHEALTH_loader import MHealthDataset
+from dataset.hmc_loader import HMCSleepDataset
+from dataset.WESAD_loader import MultiModalWESADDataset
+
 from utils.metrics import compute_metrics, print_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -67,6 +70,7 @@ class AgentSequentialTrainer:
             agent: SensorGatingAgent,
             train_dataset: SequentialDataset,
             val_dataset: Optional[SequentialDataset] = None,
+            only_predictive: bool = False,
             batch_size: int = 8,
             learning_rate: float = 1e-3,
             agent_learning_rate: float = 1e-3,
@@ -100,6 +104,8 @@ class AgentSequentialTrainer:
     ):
         self.model = model
         self.agent = agent
+        self.only_predictive = only_predictive
+
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.batch_size = batch_size
@@ -437,7 +443,10 @@ class AgentSequentialTrainer:
                     p_st_expanded = p_st_expanded.repeat(1, 1, channels_per_modality, T)  # [B, M, channels_per_mod, T]
                     p_st_expanded = p_st_expanded.view(B, C, T)  # [B, C, T]
 
-                    window_masked = window * p_st_expanded
+                    if not self.only_predictive:
+                        window_masked = window * p_st_expanded
+                    else:
+                        window_masked = window
 
                     # Update sensor history
                     sensor_history = torch.cat([
@@ -571,6 +580,8 @@ class AgentSequentialTrainer:
                     if self.use_predictive_loss:
                         self.schedulers["predictive"].step()
 
+            # print("log_threshold grad:", self.model.adaptive_sensing['m1'].log_threshold.grad)
+
         # Compute average metrics
         avg_ce_loss = total_ce_loss / num_chunks if num_chunks > 0 else 0.0
         avg_gating_loss = total_gating_loss / num_chunks if num_chunks > 0 else 0.0
@@ -655,7 +666,11 @@ class AgentSequentialTrainer:
                     p_soft_expanded = p_soft.unsqueeze(-1).unsqueeze(-1)
                     p_soft_expanded = p_soft_expanded.repeat(1, 1, channels_per_modality, T)
                     p_soft_expanded = p_soft_expanded.view(B, C, T)
-                    window_masked = window * p_soft_expanded
+
+                    if not self.only_predictive:
+                        window_masked = window * p_soft_expanded
+                    else:
+                        window_masked = window
 
                     # Update history
                     sensor_history = torch.cat([
@@ -719,19 +734,17 @@ class AgentSequentialTrainer:
         if total_samples == 0:
             return {"val_loss": 0.0, "val_accuracy": 0.0, "val_sensor_usage": 1.0}
 
-        metrics = compute_metrics(all_labels, all_preds, average='macro')
+        metrics = compute_metrics(all_labels, all_preds, use_weighted=True)
         print_metrics(metrics)
 
         avg_loss = total_ce_loss / total_samples
         avg_sensor_usage = total_sensor_usage / max(sensor_usage_counts, 1)
         avg_sensor_SD_active_ratio = total_sensor_SD_active_ratio / max(sensor_usage_counts, 1)
-        avg_sensor_usage_combine = avg_sensor_usage * avg_sensor_SD_active_ratio
 
         return {
             "val_loss": round(avg_loss, 4),
             "val_sensor_usage": round(avg_sensor_usage, 4),
             "avg_sensor_SD_active_ratio": round(avg_sensor_SD_active_ratio, 4),
-            "avg_sensor_usage_combine": round(avg_sensor_usage_combine, 4),
             "val_accuracy": round(metrics['accuracy'], 4),
             # "val_f1-score": round(metrics['f1_score'], 4),
             # "Confusion Matrix": metrics["confusion_matrix"]
@@ -775,18 +788,22 @@ class AgentSequentialTrainer:
                     epoch_predictive_losses.append(metrics["predictive_loss"])
 
                     if self.is_main_process and batch_idx % self.log_interval == 0:
-                        log_info(f"Step {batch_idx}: loss={metrics['loss']:.4f}, "
-                                 f"ce_loss={metrics['ce_loss']:.4f}, "
-                                 f"gating_loss={metrics['gating_loss']:.4f}, "
-                                 f"contrastive_loss={metrics['contrastive_loss']:.4f}, "
-                                 f"predictive_loss={metrics['predictive_loss']:.4f}, "
-                                 f"acc={metrics['accuracy']:.4f}, "
-                                 f"sensor_usage={metrics['sensor_usage']:.3f}, "
-                                 f"sensor_SD_active_ratio={metrics['sensor_SD_active_ratio']:.3f}, "
-                                 f"m_lr={metrics['model_lr']:.2e}, "
-                                 f"a_lr={metrics['agent_lr']:.2e}, "
-                                 f"p_lr={metrics['predictive_lr']:.2e}" if self.use_predictive_loss else ""
-                        )
+                        log_msg = f"Step {batch_idx}: loss={metrics['loss']:.4f}, " \
+                                  f"ce_loss={metrics['ce_loss']:.4f}, " \
+                                  f"gating_loss={metrics['gating_loss']:.4f}, " \
+                                  f"contrastive_loss={metrics['contrastive_loss']:.4f}, " \
+                                  f"predictive_loss={metrics['predictive_loss']:.4f}, " \
+                                  f"acc={metrics['accuracy']:.4f}, " \
+                                  f"sensor_usage={metrics['sensor_usage']:.3f}, " \
+                                  f"sensor_SD_active_ratio={metrics['sensor_SD_active_ratio']:.3f}, " \
+                                  f"m_lr={metrics['model_lr']:.2e}, " \
+                                  f"a_lr={metrics['agent_lr']:.2e}"
+
+                        if self.use_predictive_loss:
+                            log_msg += f", p_lr={metrics['predictive_lr']:.2e}"
+
+                        log_info(log_msg)
+
 
             if epoch_losses and self.is_main_process:
                 epoch_time = time.time() - epoch_start_time
@@ -936,6 +953,7 @@ if __name__ == "__main__":
     parser.add_argument('--window_sec', type=float, default=1.0)
     parser.add_argument('--stride_sec', type=float, default=10)
     # Model Config
+    parser.add_argument('--only_predictive', action='store_true')
     parser.add_argument('--use_device_wise_model', action='store_true', help='use device embedded tokenizer based \
                         Transformer model(embeddings are not embeded in sensor-wise)')
     parser.add_argument('--use_fm_mdoel', action='store_true', help='use foundation model, can not setup fm model while\
@@ -955,6 +973,8 @@ if __name__ == "__main__":
     parser.add_argument('--use_predictive_loss', action='store_true')
     parser.add_argument('--predictive_weight', type=float, default=0.1)
     parser.add_argument('--predictive_offset', type=int, default=1)
+    parser.add_argument('--SD_active_weight', type=float, default=0.1)
+    parser.add_argument('--init_threshold', type=float, default=0.4)
 
     args = parser.parse_args()
 
@@ -1013,7 +1033,126 @@ if __name__ == "__main__":
     #     if args.use_fm_mdoel:
     #         model = build_FMformer(num_classes=num_classes, model_dim=512, return_mem=True, modalities=modalities)
     #     else:
+    elif args.dataset == "hmc":
+        global_stats = {"mean": np.array([9.1890168e-01, 1.9557451e+00, 2.4014959e+00, 1.6120193e+00,
+                        7.8689933e-05, 1.9333732e+00, 3.5932889e+00, 2.4175742e+00]),
+                        "std": np.array([ 40.361404, 25.491713, 28.026707, 35.241245, 3.7148967,
+                        30.820967, 41.629414, 124.64315])}
+
+        # Final: {0: 23686, 1: 15548, 2: 50083, 3: 26671, 4: 21255} | Total: 137243
+        dataset = HMCSleepDataset(
+            data_root=data_root,
+            subjects=None,
+            balance=False,
+            remove_wake=False,
+            apply_notch=True, notch_freq=50.0,
+            apply_emg_hp=True,
+            apply_ecg_filter=False,
+            global_stats=global_stats
+        )  # 30s-windows
+        dataset = DeltaDataset(dataset, axis=-1)
+        train_ratio = 0.8
+        all_subjects = dataset.subjects
+
+        np.random.seed(42)
+        np.random.shuffle(all_subjects)
+
+        split_idx = int(len(all_subjects) * train_ratio)
+        train_subjects = sorted(all_subjects[:split_idx])
+        val_subjects = sorted(all_subjects[split_idx:])
+
+        num_classes = 5
+        weights = torch.tensor([1.1, 1.5, 0.5, 1, 1.25])
+        weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
+        num_modal = 8
+        # if not args.use_device_wise_model:
+        #     modalities = [
+        #         ModalityConfig(f'm{i}', 1, 10, 0) for i in range(num_modal)
+        #     ]
+        # else:
+        #     modalities = [
+        #         ModalityConfig('al', 3, 10, 0), ModalityConfig('gl', 3, 10, 0),
+        #         ModalityConfig('ar', 3, 10, 1), ModalityConfig('gr', 3, 10, 1),
+        #     ]
+        modalities = [
+            ModalityConfig(f'm{i}', 1, 30, 0) for i in range(num_modal)
+        ]
+    elif args.dataset == "hmc":
+        global_stats = {"mean": np.array([9.1890168e-01, 1.9557451e+00, 2.4014959e+00, 1.6120193e+00,
+                        7.8689933e-05, 1.9333732e+00, 3.5932889e+00, 2.4175742e+00]),
+                        "std": np.array([ 40.361404, 25.491713, 28.026707, 35.241245, 3.7148967,
+                        30.820967, 41.629414, 124.64315])}
+
+        # Final: {0: 23686, 1: 15548, 2: 50083, 3: 26671, 4: 21255} | Total: 137243
+        dataset = HMCSleepDataset(
+            data_root=data_root,
+            subjects=None,
+            balance=False,
+            remove_wake=False,
+            apply_notch=True, notch_freq=50.0,
+            apply_emg_hp=True,
+            apply_ecg_filter=False,
+            global_stats=global_stats
+        )  # 30s-windows
+        train_ratio = 0.8
+        all_subjects = dataset.subjects
+
+        np.random.seed(42)
+        np.random.shuffle(all_subjects)
+
+        split_idx = int(len(all_subjects) * train_ratio)
+        train_subjects = sorted(all_subjects[:split_idx])
+        val_subjects = sorted(all_subjects[split_idx:])
+
+        num_classes = 5
+        weights = torch.tensor([1.1, 1.5, 0.5, 1, 1.25])
+        weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
+        num_modal = 8
+        # if not args.use_device_wise_model:
+        #     modalities = [
+        #         ModalityConfig(f'm{i}', 1, 10, 0) for i in range(num_modal)
+        #     ]
+        # else:
+        #     modalities = [
+        #         ModalityConfig('al', 3, 10, 0), ModalityConfig('gl', 3, 10, 0),
+        #         ModalityConfig('ar', 3, 10, 1), ModalityConfig('gr', 3, 10, 1),
+        #     ]
+        modalities = [
+            ModalityConfig(f'm{i}', 1, 30, 0) for i in range(num_modal)
+        ]
+    elif args.dataset == "wesad":
+        dataset = MultiModalWESADDataset(args.root, [2,3], window_sec=10, target_fs=64)
+        train_subjects = [2]
+        val_subjects = [3]
+        num_classes = 3
+        num_modal = 14
+        if not args.use_device_wise_model:
+            modalities = [
+                # RespiBAN chest sensor (device 0)
+                ModalityConfig('chest_acc', 3, 10, 0),
+                ModalityConfig('chest_ecg', 1, 10, 0),
+                ModalityConfig('chest_emg', 1, 10, 0),
+                ModalityConfig('chest_eda', 1, 10, 0),
+                ModalityConfig('chest_temp', 1, 10, 0),
+                ModalityConfig('chest_resp', 1, 10, 0),
+
+                # Empatica E4 wrist sensor (device 1)
+                ModalityConfig('wrist_acc', 3, 10, 1),
+                ModalityConfig('wrist_bvp', 1, 10, 1),
+                ModalityConfig('wrist_eda', 1, 10, 1),
+                ModalityConfig('wrist_temp', 1, 10, 1),
+            ]
+        else:
+            # Device-wise grouping (optional)
+            modalities = [
+                ModalityConfig('chest', 8, 10, 0),
+                ModalityConfig('wrist', 6, 10, 1),
+            ]
+
+
     model = build_adaptive_sigma_former(num_classes=num_classes, model_dim=512, return_mem=True, return_sensing_info=True,
+                                        skip_steps=5,
+                                        init_threshold=args.init_threshold,
                                         modalities=modalities, modal_fusion=args.modal_fusion)
     agent = SensorGatingAgent(num_modalities=num_modal, feature_dim=512)
 
@@ -1048,7 +1187,9 @@ if __name__ == "__main__":
             "memory_bank_size": args.memory_bank_size,
             "use_predictive_loss": args.use_predictive_loss,
             "predictive_weight": args.predictive_weight,
-            "predictive_offset": args.predictive_offset
+            "predictive_offset": args.predictive_offset,
+            "SD_active_weight": args.SD_active_weight,
+            "only_predictive": args.only_predictive
         },
         ddp_config=ddp_config
     )

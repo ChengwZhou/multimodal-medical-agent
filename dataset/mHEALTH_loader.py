@@ -9,7 +9,7 @@ from typing import List, Tuple, Optional
 from dataset.delta_dataset import DeltaDataset  # Assuming delta_dataset.py is available
 
 from torch.utils.data import DataLoader
-from trainer.sequential_trainer import SequentialDataset, collate_sequential_batch
+from dataset.sequential_dataset import SequentialDataset, collate_sequential_batch
 
 # Configure logging (aligned with sequential_trainer.py)
 logging.basicConfig(level=logging.INFO)
@@ -213,6 +213,7 @@ def get_dataloaders(data_root: str, batch_size: int = 64, time_steps: int = 100,
         data_root: Data directory path
         batch_size: Batch size for data loaders
         time_steps: Sliding window length
+        time_steps: Sliding window length
         step: Sliding window step size
         balance: Whether to balance the dataset
         remove_zero_activity: Whether to remove Activity=0 samples
@@ -251,6 +252,7 @@ def get_dataloaders(data_root: str, batch_size: int = 64, time_steps: int = 100,
     # Wrap in SequentialDataset for sequential processing
     train_dataset = SequentialDataset(train_base_dataset, subject_ids=train_subjects)
     test_dataset = SequentialDataset(test_base_dataset, subject_ids=test_subjects)
+    print(train_dataset.max_lengths)
 
     # Create data loaders with sequential collate function
     train_loader = DataLoader(
@@ -275,95 +277,103 @@ def get_dataloaders(data_root: str, batch_size: int = 64, time_steps: int = 100,
 
 if __name__ == "__main__":
     import time
-
+    import matplotlib.pyplot as plt
 
     # Test configuration
     data_root = "/Users/chengweizhou/PycharmProjects/data/MHEALTHDATASET"  # Update with your actual path
 
-    print("=" * 60)
-    print("Testing MHealth Sequential Dataset")
-    print("=" * 60)
+    print("=" * 80)
+    print("Testing MHealth + DeltaDataset + SequentialDataset")
+    print("=" * 80)
 
     try:
-        # Test without balancing (to support get_subject_sequence)
-        print("Initializing sequential dataset (balance=False)...")
+        # ========================================
+        # 1. Test without DeltaDataset (baseline)
+        # ========================================
+        print("\n1. Testing without DeltaDataset...")
         start_time = time.time()
 
         base_dataset = MHealthDataset(
             data_root=data_root,
-            subjects=list(range(1, 11)),
+            subjects=[1],  # 只测一个 subject 加快速度
             time_steps=100,
             step=50,
             balance=False,
             remove_zero_activity=True
         )
-        dataset = SequentialDataset(base_dataset)
+        seq_dataset = SequentialDataset(base_dataset, subject_ids=[1])
+        loader = DataLoader(seq_dataset, batch_size=1, shuffle=False, collate_fn=collate_sequential_batch)
+
+        # 取第一个 batch
+        batch = next(iter(loader))
+        x_orig = batch.sequences[0]  # [C, max_T]
+        y_orig = batch.labels[0]
+        lengths = batch.seq_lengths[0].item()
+
+        print(f"   Original x shape: {x_orig.shape}")
+        print(f"   Sequence length: {lengths}")
+        print(f"   Label sequence: {y_orig[:10].tolist()}...")
+
+        # 取第一个模态第一个时间步
+        signal_orig = x_orig[0, 0, :10]  # [T]
+        print(signal_orig)
+        print(f"   First modality range: [{signal_orig.min():.4f}, {signal_orig.max():.4f}]")
 
         init_time = time.time() - start_time
-        print(f"Dataset initialization took: {init_time:.2f} seconds")
-        print()
+        print(f"   Init time: {init_time:.2f}s")
 
-        # Basic dataset info
-        print("Dataset Information:")
-        print(f"  Total subjects: {len(dataset)}")
-        print(f"  Subject IDs: {dataset.subject_ids}")
-        print()
-
-        # Test data loading
-        print("Testing data loading...")
-        if len(dataset) > 0:
-            subject_id, sequence = dataset[0]
-            print(f"Subject {subject_id} sequence:")
-            print(f"  Number of windows: {len(sequence)}")
-            if sequence:
-                x, y = sequence[0]
-                print(f"  First window shape: {x.shape}")
-                print(f"  First window label: {y}")
-                print(f"  Tensor dtype: {x.dtype}")
-                print(f"  Tensor range: [{x.min():.4f}, {x.max():.4f}]")
-            print()
-
-        # Test data loader
-        print("Testing data loader...")
-        loader = DataLoader(dataset, batch_size=2, shuffle=False, collate_fn=collate_sequential_batch)
-        for batch in loader:
-            print("Batch Information:")
-            print(f"  Sequences shape: {batch.sequences.shape}")
-            print(f"  Labels shape: {batch.labels.shape}")
-            print(f"  Sequence lengths: {batch.seq_lengths.tolist()}")
-            print(f"  Subject IDs: {batch.subject_ids}")
-            break  # Only test one batch
-        print()
-
-        # Test
-        print("Initializing sequential dataset (balance=False)...")
+        # ========================================
+        # 2. Test WITH DeltaDataset
+        # ========================================
+        print("\n2. Testing WITH DeltaDataset...")
         start_time = time.time()
 
-        base_balanced_dataset = MHealthDataset(
-            data_root=data_root,
-            subjects=list(range(1, 11)),
-            time_steps=100,
-            step=50,
-            balance=False,
-            remove_zero_activity=True
-        )
-        balanced_dataset = SequentialDataset(base_balanced_dataset)
+        delta_dataset = DeltaDataset(base_dataset, axis=-1)  # 沿时间轴差分
+        seq_delta_dataset = SequentialDataset(delta_dataset, subject_ids=[1])
+        delta_loader = DataLoader(seq_delta_dataset, batch_size=1, shuffle=False, collate_fn=collate_sequential_batch)
 
-        init_time = time.time() - start_time
-        print(f"Balanced dataset initialization took: {init_time:.2f} seconds")
-        print()
+        delta_batch = next(iter(delta_loader))
+        x_delta = delta_batch.sequences[0]  # [C, max_T]
+        print(f"   Delta x shape: {x_delta.shape}")
+        print(f"   Delta sequence length: {delta_batch.seq_lengths[0].item()}")
 
-        print("Testing get_subject_sequence with balance=True...")
-        try:
-            sequence = balanced_dataset.subject_ids[0]
-            print("  ⚠ Unexpected: get_subject_sequence did not raise an error")
-        except RuntimeError as e:
-            print(f"  ✓ Expected error caught: {e}")
-        print()
+        signal_delta = x_delta[0, 0, :10]  # [T]
+        print(signal_delta)
+        print(f"   First modality delta range: [{signal_delta.min():.6f}, {signal_delta.max():.6f}]")
 
-        print("=" * 60)
-        print("All tests completed successfully!")
-        print("=" * 60)
+        # ========================================
+        # 3. Verify differencing is correct: cumsum(delta) == original
+        # ========================================
+        print("\n3. Verifying cumsum(delta) == original...")
+        signal_recovered = torch.cumsum(signal_delta, dim=0)
+        diff = torch.abs(signal_recovered - signal_orig).max().item()
+        print(f"   Max recovery error: {diff:.8f}")
+        assert diff < 1e-6, "Differencing is not reversible!"
+        print("   Recovery verified!")
+
+        # ========================================
+        # 4. Test get_dataloaders with apply_diff=True
+        # ========================================
+        # print("\n4. Testing get_dataloaders(apply_diff=True)...")
+        # train_loader, test_loader = get_dataloaders(
+        #     data_root=data_root,
+        #     batch_size=2,
+        #     time_steps=100,
+        #     step=50,
+        #     balance=False,
+        #     remove_zero_activity=True,
+        #     apply_diff=True
+        # )
+        #
+        # batch = next(iter(train_loader))
+        # print(f"   Train batch sequences shape: {batch.sequences.shape}")
+        # print(f"   Train batch labels shape: {batch.labels.shape}")
+        # print(f"   Train batch seq_lengths: {batch.seq_lengths.tolist()}")
+        # print(f"   First sequence first modality delta[0]: {batch.sequences[0, 0, 0].item():.6f}")
+        #
+        # print("\n" + "=" * 80)
+        # print("All DeltaDataset tests passed!")
+        # print("=" * 80)
 
     except FileNotFoundError as e:
         print(f"Error: Data directory not found - {e}")

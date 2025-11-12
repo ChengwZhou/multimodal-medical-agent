@@ -18,6 +18,7 @@ from dataset.mHEALTH_loader import MHealthDataset
 from dataset.ScientISST_MOVE_loader import split_by_subject, filter_labels, ScientISSTMOVEDataset
 # from dataset.WESAD_loader import MultiModalWESADDataset, wesad_split_by_subject
 from dataset.IMU_loader import IMUDataset
+from dataset.hmc_loader import HMCSleepDataset
 
 from utils.metrics import compute_metrics, print_metrics
 from utils.modality_config import ModalityConfig
@@ -283,6 +284,67 @@ def main():
             ModalityConfig(f'm{i}', 1, 10, 0) for i in range(12)
         ]
         num_modal = 12
+
+    elif args.dataset == "hmc":
+        global_stats = {"mean": np.array([9.1890168e-01, 1.9557451e+00, 2.4014959e+00, 1.6120193e+00,
+                        7.8689933e-05, 1.9333732e+00, 3.5932889e+00, 2.4175742e+00]),
+                        "std": np.array([ 40.361404, 25.491713, 28.026707, 35.241245, 3.7148967,
+                        30.820967, 41.629414, 124.64315])}
+
+        # Final: {0: 23686, 1: 15548, 2: 50083, 3: 26671, 4: 21255} | Total: 137243
+        dataset = HMCSleepDataset(
+            data_root=args.data_root,
+            subjects=None,
+            balance=False,
+            remove_wake=False,
+            apply_notch=True, notch_freq=50.0,
+            apply_emg_hp=True,
+            apply_ecg_filter=False,
+            global_stats=global_stats
+        )  # 30s-windows
+        train_ratio = 0.8
+        all_subjects = dataset.subjects
+
+        np.random.seed(42)
+        np.random.shuffle(all_subjects)
+
+        split_idx = int(len(all_subjects) * train_ratio)
+        train_subjects = sorted(all_subjects[:split_idx])
+        val_subjects = sorted(all_subjects[split_idx:])
+
+        train_subset = HMCSleepDataset(
+            data_root=args.data_root,
+            subjects=train_subjects,
+            balance=False,
+            remove_wake=False,
+            apply_notch=True, notch_freq=50.0,
+            apply_emg_hp=True,
+            apply_ecg_filter=False,
+            global_stats=global_stats
+        )
+        val_subset = HMCSleepDataset(
+            data_root=args.data_root,
+            subjects=val_subset,
+            balance=False,
+            remove_wake=False,
+            apply_notch=True, notch_freq=50.0,
+            apply_emg_hp=True,
+            apply_ecg_filter=False,
+            global_stats=global_stats
+        )
+        train_sampler = DistributedSampler(train_subset, num_replicas=world_size, rank=rank,
+                                           shuffle=True) if world_size > 1 else None
+        train_loader = DataLoader(train_subset, batch_size=args.batch_size, sampler=train_sampler, shuffle=(train_sampler is None),
+                                 num_workers=args.num_workers, pin_memory=True, drop_last=False)
+        val_loader = DataLoader(val_subset, batch_size=args.batch_size, shuffle=False,
+                                num_workers=args.num_workers, pin_memory=True, drop_last=False)
+        num_classes = 5
+        weights = torch.tensor([1.1, 1.5, 0.5, 1, 1.25])
+        weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
+        num_modal = 8
+        modalities = [
+            ModalityConfig(f'm{i}', 1, 30, 0) for i in range(num_modal)
+        ]
 
     # elif args.dataset == 'wesad':
     #     dataset = MultiModalWESADDataset(
