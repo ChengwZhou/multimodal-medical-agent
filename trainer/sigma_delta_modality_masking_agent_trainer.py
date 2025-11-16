@@ -31,10 +31,11 @@ from collections import deque, defaultdict
 # from models.former_sensor import build_former
 # from models.former_device import build_former_device
 from models.agent_sensor_masking import SensorGatingAgent
-# from models.agent_device_masking import DeviceGatingAgent
+from models.agent_device_masking import DeviceGatingAgent
 # from models.FMformer import build_FMformer
 from utils.modality_config import ModalityConfig
 from models.sigma_former import build_adaptive_sigma_former
+from models.sigma_former_device import build_former_device
 
 from sequential_trainer import (
     setup_ddp,
@@ -155,12 +156,41 @@ class AgentSequentialTrainer:
             self.model = DDP(self.model, device_ids=[self.rank], find_unused_parameters=True)
             self.agent = DDP(self.agent, device_ids=[self.rank], find_unused_parameters=True)
 
-        # Setup optimizers
-        self.model_optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=learning_rate,
-            weight_decay=weight_decay
-        )
+        # # Setup optimizers
+        # self.model_optimizer = torch.optim.AdamW(
+        #     self.model.parameters(),
+        #     lr=learning_rate,
+        #     weight_decay=weight_decay
+        # )
+        # Setup optimizers for diff. param groups
+        threshold_lrs = {}
+        default_threshold_lr = 0.1
+
+        # 先收集 threshold params，并确保它们是 nn.Parameter
+        threshold_param_info = []  # list of dicts -> {'name': name, 'param': param, 'lr': lr}
+        excluded_ids = set()
+
+        for name, module in self.model.adaptive_sensing.items():
+            thr = getattr(module, 'log_threshold', None)
+            if thr is None:
+                continue
+            thr.requires_grad_(True)
+
+            thr_lr = threshold_lrs.get(name, default_threshold_lr)
+            threshold_param_info.append({'name': name, 'param': thr, 'lr': thr_lr})
+            excluded_ids.add(id(thr))
+
+        base_params = [p for p in self.model.parameters() if id(p) not in excluded_ids]
+        # but here keep simple:
+        param_groups = [
+            {'params': base_params, 'lr': learning_rate, 'weight_decay': weight_decay}
+        ]
+
+        log_info(threshold_param_info)
+        for info in threshold_param_info:
+            param_groups.append({'params': [info['param']], 'lr': info['lr'], 'weight_decay': weight_decay})
+
+        self.model_optimizer = torch.optim.AdamW(param_groups)
 
         self.agent_optimizer = torch.optim.AdamW(
             self.agent.parameters(),
@@ -387,6 +417,10 @@ class AgentSequentialTrainer:
 
         # Process sequences in chunks of bptt_steps
         num_chunks = (max_seq_len + self.bptt_steps - 1) // self.bptt_steps
+        # #
+        log_info(f"threshould1:, {torch.exp(model.adaptive_sensing['0'].log_threshold)}")
+        log_info(f"threshould2:, {torch.exp(model.adaptive_sensing['1'].log_threshold)}")
+        # log_info(f"threshould3:, {torch.exp(model.adaptive_sensing['2'].log_threshold)}")
 
         for chunk_idx in range(num_chunks):
             # Get chunk boundaries
@@ -490,9 +524,12 @@ class AgentSequentialTrainer:
                             total_samples += mask.sum().item()
 
                     # update total sensor sigma delta active ratio and loss
-                    sensor_SD_active_ratio = torch.stack(sensing_info["active_ratios"]).mean()
+                    sensor_SD_active_loss = torch.stack(sensing_info["active_st"]).mean()
+                    # print("sensor_SD_active_loss", sensor_SD_active_loss)
+                    # print("sensor_SD_active_ratio", torch.stack(sensing_info["active_ratios"]).mean())
+                    # sensor_SD_active_ratio = torch.stack(sensing_info["active_ratios"]).mean()
                     # total_sensor_SD_active_ratio += sensor_SD_active_ratio.detach().item()
-                    chunk_SD_active_loss += sensor_SD_active_ratio
+                    chunk_SD_active_loss += sensor_SD_active_loss
 
                     # Add gating loss if we used the agent
                     if p_soft is not None:
@@ -974,7 +1011,7 @@ if __name__ == "__main__":
     parser.add_argument('--predictive_weight', type=float, default=0.1)
     parser.add_argument('--predictive_offset', type=int, default=1)
     parser.add_argument('--SD_active_weight', type=float, default=0.1)
-    parser.add_argument('--init_threshold', type=float, default=0.4)
+    parser.add_argument('--init_threshold', type=float, default=0.1)
 
     args = parser.parse_args()
 
@@ -988,7 +1025,6 @@ if __name__ == "__main__":
                                         none_policy="ignore")
         dataset = filter_labels(dataset, remove_labels=["sprint", "jumps"])
         print(dataset.label_map)
-        dataset = DeltaDataset(dataset, axis=-1)
         train_subjects = dataset.subjects[:int(0.8 * len(dataset.subjects))]
         val_subjects = dataset.subjects[int(0.8 * len(dataset.subjects)):]
         num_classes = len(dataset.label_map)
@@ -1010,7 +1046,6 @@ if __name__ == "__main__":
     elif args.dataset == "mhealth":
         dataset = MHealthDataset(args.root, subjects=[i for i in range(0, 11)], time_steps=100, step=50,
                                  balance=False, majority_n=500)
-        dataset = DeltaDataset(dataset, axis=-1)
         train_subjects = [i for i in range(1, 8)]
         val_subjects = [8, 9, 10]
         num_classes = 12
@@ -1026,57 +1061,6 @@ if __name__ == "__main__":
                 ModalityConfig('al', 3, 10, 0), ModalityConfig('gl', 3, 10, 0),
                 ModalityConfig('ar', 3, 10, 1), ModalityConfig('gr', 3, 10, 1),
             ]
-    # if args.use_device_wise_model:
-    #     model = build_former_device(num_classes=num_classes, model_dim=512, return_mem=True, modalities=modalities, modal_fusion=args.modal_fusion)
-    #     agent = DeviceGatingAgent(num_modalities=num_modal, modalities=modalities, feature_dim=512)
-    # else:
-    #     if args.use_fm_mdoel:
-    #         model = build_FMformer(num_classes=num_classes, model_dim=512, return_mem=True, modalities=modalities)
-    #     else:
-    elif args.dataset == "hmc":
-        global_stats = {"mean": np.array([9.1890168e-01, 1.9557451e+00, 2.4014959e+00, 1.6120193e+00,
-                        7.8689933e-05, 1.9333732e+00, 3.5932889e+00, 2.4175742e+00]),
-                        "std": np.array([ 40.361404, 25.491713, 28.026707, 35.241245, 3.7148967,
-                        30.820967, 41.629414, 124.64315])}
-
-        # Final: {0: 23686, 1: 15548, 2: 50083, 3: 26671, 4: 21255} | Total: 137243
-        dataset = HMCSleepDataset(
-            data_root=data_root,
-            subjects=None,
-            balance=False,
-            remove_wake=False,
-            apply_notch=True, notch_freq=50.0,
-            apply_emg_hp=True,
-            apply_ecg_filter=False,
-            global_stats=global_stats
-        )  # 30s-windows
-        dataset = DeltaDataset(dataset, axis=-1)
-        train_ratio = 0.8
-        all_subjects = dataset.subjects
-
-        np.random.seed(42)
-        np.random.shuffle(all_subjects)
-
-        split_idx = int(len(all_subjects) * train_ratio)
-        train_subjects = sorted(all_subjects[:split_idx])
-        val_subjects = sorted(all_subjects[split_idx:])
-
-        num_classes = 5
-        weights = torch.tensor([1.1, 1.5, 0.5, 1, 1.25])
-        weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
-        num_modal = 8
-        # if not args.use_device_wise_model:
-        #     modalities = [
-        #         ModalityConfig(f'm{i}', 1, 10, 0) for i in range(num_modal)
-        #     ]
-        # else:
-        #     modalities = [
-        #         ModalityConfig('al', 3, 10, 0), ModalityConfig('gl', 3, 10, 0),
-        #         ModalityConfig('ar', 3, 10, 1), ModalityConfig('gr', 3, 10, 1),
-        #     ]
-        modalities = [
-            ModalityConfig(f'm{i}', 1, 30, 0) for i in range(num_modal)
-        ]
     elif args.dataset == "hmc":
         global_stats = {"mean": np.array([9.1890168e-01, 1.9557451e+00, 2.4014959e+00, 1.6120193e+00,
                         7.8689933e-05, 1.9333732e+00, 3.5932889e+00, 2.4175742e+00]),
@@ -1148,13 +1132,27 @@ if __name__ == "__main__":
                 ModalityConfig('chest', 8, 10, 0),
                 ModalityConfig('wrist', 6, 10, 1),
             ]
+    if args.use_device_wise_model:
+        model = build_former_device(num_classes=num_classes, model_dim=512, return_mem=True,
+                                            return_sensing_info=True,
+                                            skip_steps=1,
+                                            init_threshold=args.init_threshold,
+                                            modalities=modalities, modal_fusion=args.modal_fusion)
+        agent = DeviceGatingAgent(num_modalities=num_modal, modalities=modalities, feature_dim=512)
+    else:
+        model = build_adaptive_sigma_former(num_classes=num_classes, model_dim=512, return_mem=True,
+                                            return_sensing_info=True,
+                                            skip_steps=1,
+                                            init_threshold=args.init_threshold,
+                                            modalities=modalities, modal_fusion=args.modal_fusion)
+        agent = SensorGatingAgent(num_modalities=num_modal, feature_dim=512)
 
 
-    model = build_adaptive_sigma_former(num_classes=num_classes, model_dim=512, return_mem=True, return_sensing_info=True,
-                                        skip_steps=5,
-                                        init_threshold=args.init_threshold,
-                                        modalities=modalities, modal_fusion=args.modal_fusion)
-    agent = SensorGatingAgent(num_modalities=num_modal, feature_dim=512)
+    # model = build_adaptive_sigma_former(num_classes=num_classes, model_dim=512, return_mem=True, return_sensing_info=True,
+    #                                     skip_steps=5,
+    #                                     init_threshold=args.init_threshold,
+    #                                     modalities=modalities, modal_fusion=args.modal_fusion)
+    # agent = SensorGatingAgent(num_modalities=num_modal, feature_dim=512)
 
     ddp_config = {}
     if is_distributed:

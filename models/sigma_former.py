@@ -162,7 +162,8 @@ class AdaptiveSensingModule(nn.Module):
         # 1. 计算软权重（用于梯度）
         abs_x = torch.abs(x)
         # 使用 sigmoid 让阈值附近有平滑的梯度
-        soft_weight = torch.sigmoid((abs_x - th) / (th * 0.1))  # 0.1 是温度参数
+        # print(abs_x.max(), abs_x.min())
+        soft_weight = torch.sigmoid((abs_x - th)/3)  # 0.1 is the temperature
 
         # 2. 计算硬触发（用于前向传播）
         trigger = abs_x < th
@@ -185,7 +186,9 @@ class AdaptiveSensingModule(nn.Module):
         mask = active_hard
         active_ratio = mask.mean()
 
-        return masked_delta.unsqueeze(1), mask.unsqueeze(1), active_ratio
+        # print(masked_delta[0][:10])
+
+        return masked_delta.unsqueeze(1), mask.unsqueeze(1), active.mean(), active_ratio
 
         # B, C, T = delta_input.shape
         # assert C == 1
@@ -227,10 +230,14 @@ class ConvTokenizer1D(nn.Module):
             [B, L, out_ch] - cumulative features after conv and cumsum
         """
         x = self.conv(x)  # [B, out_ch, L]
-        x = x.transpose(1, 2)  # [B, L, out_ch]
 
+        # print(x.size())
+        # print("before", x[0][:4])
         # Convert differential to cumulative
-        x = torch.cumsum(x, dim=1)
+        # x = torch.cumsum(x, dim=-1)
+        # print(x[0][:4])
+
+        x = x.transpose(1, 2)  # [B, L, out_ch]
 
         x = self.norm(x)
         return x
@@ -264,7 +271,7 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
         super().__init__()
 
         if modalities is None:
-            modalities = [ModalityConfig(f'm{i}', 1, 10) for i in range(14)]
+            modalities = [ModalityConfig(f'm{i}', 1, 10) for i in range(2)]
 
         self.modalities = modalities
         self.model_dim = model_dim
@@ -373,7 +380,7 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
         assert C == len(self.modalities), f"expected {len(self.modalities)} channels, got {C}"
 
         per_mod_tokens = []
-        sensing_info = {'masks': [], 'active_ratios': []}
+        sensing_info = {'masks': [], 'active_st': [], 'active_ratios': []}
 
         # Process each modality
         for i, m in enumerate(self.modalities):
@@ -381,17 +388,20 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
             ch = x[:, i:i+m.in_ch, :]  # [B, m, T]
             # print(f"m{i}: {ch[0][0][:10]}")
 
-            # Apply adaptive sensing
-            masked_ch, mask, active_ratio = self.adaptive_sensing[m.name](ch)  # [B, 1, T], [B, 1, T]
-
-            # Store sensing info
-            if self.return_sensing_info:
-                sensing_info['masks'].append(mask)
-                active_ratio = mask.float().mean()
-                sensing_info['active_ratios'].append(active_ratio)
+            # # Apply adaptive sensing
+            # masked_ch, mask, active_st, active_ratio = self.adaptive_sensing[m.name](ch)  # [B, 1, T], [B, 1, T]
+            #
+            # # Store sensing info
+            # if self.return_sensing_info:
+            #     sensing_info['masks'].append(mask)
+            #     sensing_info['active_st'].append(active_st.float().mean())
+            #     active_ratio = mask.float().mean()
+            #     sensing_info['active_ratios'].append(active_ratio)
 
             # Tokenize masked input
-            tokens = self.tokenizers[m.name](masked_ch)  # [B, L, model_dim]
+            # tokens = self.tokenizers[m.name](masked_ch)  # [B, L, model_dim]
+
+            tokens = self.tokenizers[m.name](ch)
             per_mod_tokens.append(tokens)
 
         # Optional modal dropout
@@ -401,8 +411,8 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
         if self.modal_fusion == "cross_atten":
             concat_tokens = self.modal_cross_attn(per_mod_tokens, kv_masks=history_mask)
         else:
-            concat_tokens = torch.cat(per_mod_tokens, dim=1)  # [B, L_total, 1]
-
+            concat_tokens = torch.cat(per_mod_tokens, dim=1)  # [B, L_total, T]
+        # print("c", concat_tokens.size())
 
         # Add positional encoding
         fused = self.positional(concat_tokens)
@@ -469,7 +479,7 @@ def build_adaptive_sigma_former(
         modalities=modalities,
         use_modal_dropout=True,
         modal_dropout_p=0.15,
-        max_len=500,
+        max_len=4000,
         return_mem=return_mem,
         init_threshold=init_threshold,
         skip_steps=skip_steps,
@@ -488,45 +498,49 @@ if __name__ == "__main__":
     print("\n1. Model with fixed skip steps:")
     model_fixed = build_adaptive_sigma_former(
         num_classes=12,
-        model_dim=32,
+        model_dim=512,
         return_mem=True,
         init_threshold=0.4,
         skip_steps=5,
         learnable_skip=False,
         return_sensing_info=True
     )
+    print(model_fixed)
 
-    x = torch.randn(8, 14, 100)  # [B, 14, T]
-    history = torch.randn(8, 140, 32)  # [B, L_total, model_dim]
-    history_mask = torch.randn(8, 140, 32)  # [B, L_total, model_dim]
+    # x = torch.ones(8, 14, 100)  # [B, 14, T]
+    x = torch.zeros(8, 2, 100)
+    x[:, :, 0] = 1
+    print(x.size())
+    history = torch.randn(8, 140, 512)  # [B, L_total, model_dim]
+    history_mask = torch.randn(8, 140, 512)  # [B, L_total, model_dim]
 
     logits, mem, sensing_info = model_fixed(x, history=history, history_mask=history_mask)
     print(f"  Logits shape: {logits.shape}")  # [8, 12]
     print(f"  Memory shape: {mem.shape}")  # [8, 140, 32]
     print(f"  Active ratios: {[f'{r:.2%}' for r in sensing_info['active_ratios'][:3]]}...")
 
-    # Test with learnable skip steps
-    print("\n2. Model with learnable skip steps:")
-    model_learnable = build_adaptive_sigma_former(
-        num_classes=12,
-        model_dim=32,
-        return_mem=False,
-        init_threshold=0.1,
-        skip_steps=3,
-        learnable_skip=True,
-        return_sensing_info=True
-    )
-
-    logits, sensing_info = model_learnable(x, history=history, history_mask=history_mask)
-    print(f"  Logits shape: {logits.shape}")
-    print(f"  Active ratios: {[f'{r:.2%}' for r in sensing_info['active_ratios'][:3]]}...")
-
-    # Show sensing parameters
-    print("\n3. Sensing parameters for first 3 modalities:")
-    stats = model_learnable.get_sensing_stats()
-    for i, (name, params) in enumerate(list(stats.items())[:3]):
-        print(f"  {name}: threshold={params['threshold']:.4f}, skip_steps={params['skip_steps']}")
-
-    print("\n" + "=" * 80)
-    print("All tests passed!")
-    print("=" * 80)
+    # # Test with learnable skip steps
+    # print("\n2. Model with learnable skip steps:")
+    # model_learnable = build_adaptive_sigma_former(
+    #     num_classes=12,
+    #     model_dim=32,
+    #     return_mem=False,
+    #     init_threshold=0.1,
+    #     skip_steps=3,
+    #     learnable_skip=True,
+    #     return_sensing_info=True
+    # )
+    #
+    # logits, sensing_info = model_learnable(x, history=history, history_mask=history_mask)
+    # print(f"  Logits shape: {logits.shape}")
+    # print(f"  Active ratios: {[f'{r:.2%}' for r in sensing_info['active_ratios'][:3]]}...")
+    #
+    # # Show sensing parameters
+    # print("\n3. Sensing parameters for first 3 modalities:")
+    # stats = model_learnable.get_sensing_stats()
+    # for i, (name, params) in enumerate(list(stats.items())[:3]):
+    #     print(f"  {name}: threshold={params['threshold']:.4f}, skip_steps={params['skip_steps']}")
+    #
+    # print("\n" + "=" * 80)
+    # print("All tests passed!")
+    # print("=" * 80)

@@ -182,7 +182,7 @@ def build_former(num_modal=14, num_classes=10, model_dim=32,  return_mem=False, 
         modalities=modalities,
         use_modal_dropout=True,
         modal_dropout_p=0.15,
-        max_len=1400,
+        max_len=5000,
         return_mem=return_mem,
         modal_fusion=modal_fusion
     )
