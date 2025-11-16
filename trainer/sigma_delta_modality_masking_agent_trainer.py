@@ -34,7 +34,7 @@ from models.agent_sensor_masking import SensorGatingAgent
 from models.agent_device_masking import DeviceGatingAgent
 # from models.FMformer import build_FMformer
 from utils.modality_config import ModalityConfig
-from models.sigma_former import build_adaptive_sigma_former
+from models.sigma_former_sensor import build_adaptive_sigma_former
 from models.sigma_former_device import build_former_device
 
 from sequential_trainer import (
@@ -1010,8 +1010,9 @@ if __name__ == "__main__":
     parser.add_argument('--use_predictive_loss', action='store_true')
     parser.add_argument('--predictive_weight', type=float, default=0.1)
     parser.add_argument('--predictive_offset', type=int, default=1)
-    parser.add_argument('--SD_active_weight', type=float, default=0.1)
+    parser.add_argument('--SD_active_weight', type=float, default=0)
     parser.add_argument('--init_threshold', type=float, default=0.1)
+    parser.add_argument('--skip_step', type=int, default=1)
 
     args = parser.parse_args()
 
@@ -1045,7 +1046,7 @@ if __name__ == "__main__":
             ]
     elif args.dataset == "mhealth":
         dataset = MHealthDataset(args.root, subjects=[i for i in range(0, 11)], time_steps=100, step=50,
-                                 balance=False, majority_n=500)
+                                 balance=False, majority_n=500, remove_zero_activity=True)
         train_subjects = [i for i in range(1, 8)]
         val_subjects = [8, 9, 10]
         num_classes = 12
@@ -1135,14 +1136,14 @@ if __name__ == "__main__":
     if args.use_device_wise_model:
         model = build_former_device(num_classes=num_classes, model_dim=512, return_mem=True,
                                             return_sensing_info=True,
-                                            skip_steps=1,
+                                            skip_steps=args.skip_step,
                                             init_threshold=args.init_threshold,
                                             modalities=modalities, modal_fusion=args.modal_fusion)
         agent = DeviceGatingAgent(num_modalities=num_modal, modalities=modalities, feature_dim=512)
     else:
         model = build_adaptive_sigma_former(num_classes=num_classes, model_dim=512, return_mem=True,
                                             return_sensing_info=True,
-                                            skip_steps=1,
+                                            skip_steps=args.skip_step,
                                             init_threshold=args.init_threshold,
                                             modalities=modalities, modal_fusion=args.modal_fusion)
         agent = SensorGatingAgent(num_modalities=num_modal, feature_dim=512)

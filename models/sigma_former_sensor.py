@@ -14,6 +14,36 @@ from utils.modality_config import ModalityConfig
 # -----------------------------
 # Utility Modules
 # -----------------------------
+
+class BypassMaskGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, delta_x, mask_pixel, prev_delta_x):
+        ctx.save_for_backward(mask_pixel)
+        ctx.prev_delta_x = prev_delta_x
+        return delta_x * mask_pixel
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        mask_pixel, = ctx.saved_tensors
+        prev_delta_x = ctx.prev_delta_x
+
+        # Normal gradient：grad_delta_x = grad_output * mask_pixel
+        grad_delta_x = grad_output * mask_pixel
+
+        # The masked portion has its gradient “bypassed” to the previous patch.
+        bypass_mask = (mask_pixel < 0.5).float()
+        grad_bypass = grad_output * bypass_mask
+
+        # Add the bypass gradient to the previous patch (dimensions must be aligned).
+        if prev_delta_x is not None:
+            grad_prev = grad_bypass  # [B, C, T]，Align to prev patch
+            # If patches do not overlap, they can be added directly; if they overlap, they must be unfolded and aligned.
+        else:
+            grad_prev = None
+
+        return grad_delta_x, None, grad_prev
+
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 10000):
         super().__init__()
@@ -29,102 +59,21 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :L]
 
 
-# class AdaptiveSensingModule(nn.Module):
-#     """
-#     Adaptive sensing module with learnable threshold for each modality.
-#     When |delta_input| < threshold, the sensor is turned off for skip_steps.
-#
-#     Args:
-#         init_threshold: Initial threshold value
-#         skip_steps: Number of timesteps to skip when threshold is not met (can be int or 'learnable')
-#         min_threshold: Minimum allowed threshold value
-#         max_threshold: Maximum allowed threshold value
-#     """
-#
-#     def __init__(self,
-#                  init_threshold: float = 0.1,
-#                  skip_steps: int = 5,
-#                  learnable_skip: bool = False,
-#                  min_threshold: float = 0.01,
-#                  max_threshold: float = 1.0):
-#         super().__init__()
-#
-#         # Learnable threshold (in log space for numerical stability)
-#         self.log_threshold = nn.Parameter(torch.tensor(math.log(init_threshold)))
-#         self.min_threshold = min_threshold
-#         self.max_threshold = max_threshold
-#
-#         # Skip steps configuration
-#         self.learnable_skip = learnable_skip
-#         if learnable_skip:
-#             # Use log space and round to nearest integer during forward
-#             self.log_skip_steps = nn.Parameter(torch.tensor(math.log(float(skip_steps))))
-#             self.min_skip = 1
-#             self.max_skip = 20
-#         else:
-#             self.skip_steps = skip_steps
-#
-#     def get_threshold(self) -> torch.Tensor:
-#         """Get the current threshold value with clamping"""
-#         threshold = torch.exp(self.log_threshold)
-#         return torch.clamp(threshold, self.min_threshold, self.max_threshold)
-#
-#     def get_skip_steps(self) -> int:
-#         """Get the current skip steps value"""
-#         if self.learnable_skip:
-#             skip = torch.exp(self.log_skip_steps)
-#             skip = torch.clamp(skip, self.min_skip, self.max_skip)
-#             return int(torch.round(skip).item())
-#         else:
-#             return self.skip_steps
-#
-#     def forward(self, delta_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-#         B, C, T = delta_input.shape
-#         assert C == 1
-#         x = delta_input.squeeze(1)  # [B, T] ← delta = xt - x{t-1}
-#
-#         threshold = self.get_threshold()
-#         skip_steps = self.get_skip_steps()
-#
-#         # Initialize per-batch state
-#         timer = torch.zeros(B, dtype=torch.long, device=x.device)  # 剩余关闭步数
-#         mask = torch.zeros_like(x)
-#         masked = torch.zeros_like(x)  # ← 输出 masked delta
-#
-#         for t in range(T):
-#             curr = x[:, t]  # 当前 delta
-#             is_on = timer <= 0  # 是否可以采样
-#
-#             # === 关键：用 |curr| 判断是否触发关闭 ===
-#             trigger_off = is_on & (torch.abs(curr) < threshold)
-#             # update timer
-#             timer = torch.where(
-#                 trigger_off,
-#                 torch.full_like(timer, skip_steps),  # 触发 → 关闭 skip_steps
-#                 torch.clamp(timer - 1, min=0)  # 否则倒计时
-#             )
-#             # decide to active
-#             active = is_on & ~trigger_off
-#             mask[:, t] = active.float()
-#
-#             masked[:, t] = torch.where(active, curr, torch.zeros_like(curr))
-#
-#         active_ratio = mask.float().mean()
-#         return masked.unsqueeze(1), mask.unsqueeze(1), active_ratio
-
-
 class AdaptiveSensingModule(nn.Module):
     """
     Fully vectorized adaptive sensing (no Python loops over B or T).
+    Skip is now performed **per patch** instead of per pixel.
     """
 
     def __init__(self,
-                 init_threshold: float = 0.1,
-                 skip_steps: int = 5,
+                 patch_size: int = 10,
+                 init_threshold: float = 0.5,
+                 skip_steps: int = 1,          # now: number of patches to skip
                  learnable_skip: bool = False,
                  min_threshold: float = 0.01,
-                 max_threshold: float = 5):
+                 max_threshold: float = 5.0):
         super().__init__()
+        self.patch_size = patch_size
         self.log_threshold = nn.Parameter(torch.tensor(math.log(init_threshold)))
         self.min_threshold = min_threshold
         self.max_threshold = max_threshold
@@ -137,110 +86,141 @@ class AdaptiveSensingModule(nn.Module):
         else:
             self.skip_steps = skip_steps
 
-    # --------------------------------------------------------------------- #
-    #  工具函数
-    # --------------------------------------------------------------------- #
+    @staticmethod
+    def _unfold(x, size, step):
+        try:
+            # PyTorch >= 2.1
+            return x.unfold(dimension=-1, size=size, step=step)
+        except TypeError:
+            # PyTorch <= 2.0
+            return x.unfold(dimension=-1, size=size, stride=step)
+
     def get_threshold(self) -> torch.Tensor:
         th = torch.exp(self.log_threshold)
         return torch.clamp(th, self.min_threshold, self.max_threshold)
 
     def get_skip_steps(self) -> int:
+        """Return the *integer* number of patches to skip."""
         if self.learnable_skip:
             s = torch.exp(self.log_skip_steps)
             s = torch.clamp(s, self.min_skip, self.max_skip)
             return int(torch.round(s).item())
         return self.skip_steps
 
-    def forward(self, delta_input: torch.Tensor):
-        B, C, T = delta_input.shape
-        assert C == 1
-        x = delta_input.squeeze(1)  # [B, T]
+    def forward(self, x: torch.Tensor):
+        B, C, T = x.shape
+        P = self.patch_size
+        assert T % P == 0, f"T={T} must be divisible by patch_size={P}"
+        L = T // P
 
-        th = self.get_threshold()
-        skip = self.get_skip_steps()
+        x_blocks = self._unfold(x, size=P, step=P)  # [B, P, L]
+        x_blocks = x_blocks.transpose(1, 2).contiguous()  # [B, L, P]
+        x_blocks = x_blocks.view(B, L, C, P)  # [B, L, C, P]
 
-        # 1. 计算软权重（用于梯度）
-        abs_x = torch.abs(x)
-        # 使用 sigmoid 让阈值附近有平滑的梯度
-        # print(abs_x.max(), abs_x.min())
-        soft_weight = torch.sigmoid((abs_x - th)/3)  # 0.1 is the temperature
+        # patch-level difference
+        zeros = torch.zeros((B, 1, C, P), device=x.device, dtype=x.dtype)
+        prev_blocks = torch.cat([zeros, x_blocks[:, :-1]], dim=1)  # [B, L, C, P]
+        delta_blocks = x_blocks - prev_blocks  # [B, L, C, P]
+        # # reshape fold to [B, C_in, T]
+        delta_x = delta_blocks.transpose(1, 2).contiguous()  # [B, L, C_in, P] → [B, C_in, L, P]
+        delta_x = delta_x.view(B, C, -1)  # [B, C_in, T]
 
-        # 2. 计算硬触发（用于前向传播）
-        trigger = abs_x < th
+        # threshold
+        th = self.get_threshold()  # scalar
+        abs_delta = torch.abs(delta_blocks)  # [B, L, C, P]
 
-        # 3. 传播 skip_end
-        t = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
-        skip_end = torch.where(trigger, t + skip, torch.full_like(t, -1))
-        skip_end = torch.cummax(skip_end, dim=1).values
+        # Calculate patch activity（mean over patch）
+        patch_activity = abs_delta.mean(dim=-1)  # [B, L, C]
 
-        # 4. 硬激活
-        timer = torch.clamp(skip_end - t, min=0)
-        active_hard = (timer == 0).float()
+        # hard trigger: entire patch average < th → trigger
+        trigger = patch_activity < th  # [B, L, C]  bool
 
-        # 5. Straight-Through Estimator
-        active = active_hard + soft_weight - soft_weight.detach()
+        # skip logic (per patch, per channel)
+        skip = self.get_skip_steps()  # int
 
-        # 6. 应用 mask
-        masked_delta = x * active
+        # patch index: [0,1,...,L-1]
+        patch_idx = torch.arange(L, device=x.device)  # [L]
+        patch_idx = patch_idx.view(1, L, 1).expand(B, L, C)  # [B, L, C]
 
-        mask = active_hard
-        active_ratio = mask.mean()
+        # skip_end: trigger → current_idx + skip
+        skip_end = torch.where(
+            trigger,
+            patch_idx + skip,
+            torch.full_like(patch_idx, -1)
+        )  # [B, L, C]
 
-        # print(masked_delta[0][:10])
+        # cummax propagates along the L dimension (each (B,C) is independent)
+        skip_end = torch.cummax(skip_end, dim=1).values  # [B, L, C]
 
-        return masked_delta.unsqueeze(1), mask.unsqueeze(1), active.mean(), active_ratio
+        timer = torch.clamp(skip_end - patch_idx, min=0)  # [B, L, C]
+        active_hard = (timer == 0).float()  # [B, L, C]
 
-        # B, C, T = delta_input.shape
-        # assert C == 1
-        # x = delta_input.squeeze(1)
-        #
-        # th = self.get_threshold()
-        # skip = self.get_skip_steps()
-        #
-        # trigger = torch.abs(x) < th
-        # t = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
-        # skip_end = torch.where(trigger, t + skip, torch.full_like(t, -1))
-        # skip_end = torch.cummax(skip_end, dim=1).values
-        # timer = torch.clamp(skip_end - t, min=0)
-        # active = timer == 0
-        #
-        # masked_delta = x * active.float()  # ← 仍是 delta！
-        # mask = active.float()
-        # active_ratio = mask.mean()
-        #
-        # return masked_delta.unsqueeze(1), mask.unsqueeze(1), active_ratio
+        active = active_hard  # [B, L, C]
+
+        # expand to pixel level: [B, L, C] → [B, C, L, P] → [B, C, T]
+        active_expanded = active_hard.unsqueeze(-1).expand(-1, -1, -1, P)  # [B, L, C, P]
+        # [B, L, C, P] → [B, C, L, P] → [B, C, T]
+        active_expanded = active_expanded.permute(0, 2, 1, 3).contiguous()  # [B, C, L, P]
+        mask_pixel = active_expanded.view(B, C, T)  # [B, C, T]
+
+        # Save prev_delta_x (pixel-level)
+        prev_delta_x = prev_blocks.permute(0, 2, 1, 3).contiguous().view(B, C, T)
+
+        # Using Custom Gradients
+        masked_delta = BypassMaskGrad.apply(delta_x, mask_pixel, prev_delta_x)
+
+        # hard mask (0/1) - Apply the same dimensionality transformation
+        active_hard_expanded = active_hard.unsqueeze(-1).expand(-1, -1, -1, P)  # [B, L, C, P]
+        active_hard_expanded = active_hard_expanded.permute(0, 2, 1, 3).contiguous()  # [B, C, L, P]
+        mask_hard = active_hard_expanded.view(B, C, T)  # [B, C, T]
+
+        # statistics
+        active_mean = active.mean()
+        active_ratio = active_hard.mean()
+
+        # --------------------------------------------------------------- #
+        # Debug print
+        # --------------------------------------------------------------- #
+        # print(f"active_hard shape: {active_hard.shape}")  # [B, L, C]
+        # print(f"mask_pixel shape: {mask_pixel.shape}")  # [B, C, T]
+        # print(f"mask_hard shape: {mask_hard.shape}")  # [B, C, T]
+        # print(f"masked_delta shape: {masked_delta.shape}")  # [B, C, T]
+        # print(f"trigger[0]:", trigger[0])  # [L, C]
+        # print(f"active_hard[0]:", active_hard[0])  # [L, C]
+        # print("masked_delta[0,0]:", masked_delta[0, 0])
+
+        return masked_delta, mask_hard, active_mean, active_ratio
 
 
 class ConvTokenizer1D(nn.Module):
     """
-    Conv tokenizer that outputs features per patch.
-    Converts differential features back to cumulative features after conv.
+    Conv tokenizer that outputs a scalar feature per patch (out_channels=1).
+    This matches the user's request to concatenate tokens into shape [B, L_total, 1].
     """
-
     def __init__(self, in_ch: int, out_ch: int = 1, patch_size: int = 10, norm: bool = True):
         super().__init__()
+        # produce one scalar per patch per channel
+        self.patch_size = patch_size
         self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=patch_size, stride=patch_size, bias=False)
         self.norm = nn.LayerNorm(out_ch) if norm else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, C_in, T] - differential features
-        Returns:
-            [B, L, out_ch] - cumulative features after conv and cumsum
-        """
-        x = self.conv(x)  # [B, out_ch, L]
+    def forward(self, x: torch.Tensor, use_patch_block_sigma: bool = True) -> torch.Tensor:
+        # x: [B, C_in, T] (but we will pass single-channel per call: C_in==1)
+        B, C_in, T = x.size()
+        P = self.patch_size
+        assert T % P == 0, "T must be divisible by patch_size"
 
-        # print(x.size())
-        # print("before", x[0][:4])
-        # Convert differential to cumulative
-        # x = torch.cumsum(x, dim=-1)
-        # print(x[0][:4])
+        if not use_patch_block_sigma:
+            patches = self.conv(x)  # [B, out_ch, L]
+        else:
+            delta_x = x
+            # Conv1d on diff
+            delta_patches = self.conv(delta_x)  # [B, out_ch, L]
+            patches = torch.cumsum(delta_patches, dim=-1)  # [B, out_ch, L]
 
-        x = x.transpose(1, 2)  # [B, L, out_ch]
-
-        x = self.norm(x)
-        return x
+        patches = patches.transpose(1, 2)     # [B, L, out_ch]
+        patches = self.norm(patches)
+        return patches                  # [B, L, out_ch]  (here out_ch==1)
 
 
 class AdaptiveSensingMultimodalTransformer(nn.Module):
@@ -389,17 +369,17 @@ class AdaptiveSensingMultimodalTransformer(nn.Module):
             # print(f"m{i}: {ch[0][0][:10]}")
 
             # # Apply adaptive sensing
-            # masked_ch, mask, active_st, active_ratio = self.adaptive_sensing[m.name](ch)  # [B, 1, T], [B, 1, T]
-            #
-            # # Store sensing info
-            # if self.return_sensing_info:
-            #     sensing_info['masks'].append(mask)
-            #     sensing_info['active_st'].append(active_st.float().mean())
-            #     active_ratio = mask.float().mean()
-            #     sensing_info['active_ratios'].append(active_ratio)
+            masked_ch, mask, active_st, active_ratio = self.adaptive_sensing[m.name](ch)  # [B, 1, T], [B, 1, T]
+
+            # Store sensing info
+            if self.return_sensing_info:
+                sensing_info['masks'].append(mask)
+                sensing_info['active_st'].append(active_st.float().mean())
+                active_ratio = mask.float().mean()
+                sensing_info['active_ratios'].append(active_ratio)
 
             # Tokenize masked input
-            # tokens = self.tokenizers[m.name](masked_ch)  # [B, L, model_dim]
+            tokens = self.tokenizers[m.name](masked_ch)  # [B, L, model_dim]
 
             tokens = self.tokenizers[m.name](ch)
             per_mod_tokens.append(tokens)
@@ -500,16 +480,17 @@ if __name__ == "__main__":
         num_classes=12,
         model_dim=512,
         return_mem=True,
-        init_threshold=0.4,
-        skip_steps=5,
+        init_threshold=0.6,
+        skip_steps=1,
         learnable_skip=False,
         return_sensing_info=True
     )
     print(model_fixed)
 
     # x = torch.ones(8, 14, 100)  # [B, 14, T]
-    x = torch.zeros(8, 2, 100)
-    x[:, :, 0] = 1
+    # x = torch.zeros(8, 2, 100)
+    # x[:, :, 0] = 1
+    x = torch.randn(8, 2, 100)
     print(x.size())
     history = torch.randn(8, 140, 512)  # [B, L_total, model_dim]
     history_mask = torch.randn(8, 140, 512)  # [B, L_total, model_dim]

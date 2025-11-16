@@ -14,6 +14,36 @@ from collections import defaultdict
 # -----------------------------
 # Utility Modules (as before)
 # -----------------------------
+
+class BypassMaskGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, delta_x, mask_pixel, prev_delta_x):
+        ctx.save_for_backward(mask_pixel)
+        ctx.prev_delta_x = prev_delta_x
+        return delta_x * mask_pixel
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        mask_pixel, = ctx.saved_tensors
+        prev_delta_x = ctx.prev_delta_x
+
+        # Normal gradient：grad_delta_x = grad_output * mask_pixel
+        grad_delta_x = grad_output * mask_pixel
+
+        # The masked portion has its gradient “bypassed” to the previous patch.
+        bypass_mask = (mask_pixel < 0.5).float()
+        grad_bypass = grad_output * bypass_mask
+
+        # Add the bypass gradient to the previous patch (dimensions must be aligned).
+        if prev_delta_x is not None:
+            grad_prev = grad_bypass  # [B, C, T]，Align to prev patch
+            # If patches do not overlap, they can be added directly; if they overlap, they must be unfolded and aligned.
+        else:
+            grad_prev = None
+
+        return grad_delta_x, None, grad_prev
+
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 10000):
         super().__init__()
@@ -28,11 +58,6 @@ class PositionalEncoding(nn.Module):
         # x: [B, L, D]
         L = x.size(1)
         return x + self.pe[:, :L]
-
-
-import math
-import torch
-import torch.nn as nn
 
 
 class AdaptiveSensingModule(nn.Module):
@@ -62,9 +87,6 @@ class AdaptiveSensingModule(nn.Module):
         else:
             self.skip_steps = skip_steps
 
-    # --------------------------------------------------------------------- #
-    #  helper: compatible unfold for both old (stride) and new (step) API
-    # --------------------------------------------------------------------- #
     @staticmethod
     def _unfold(x, size, step):
         try:
@@ -74,7 +96,6 @@ class AdaptiveSensingModule(nn.Module):
             # PyTorch <= 2.0
             return x.unfold(dimension=-1, size=size, stride=step)
 
-    # --------------------------------------------------------------------- #
     def get_threshold(self) -> torch.Tensor:
         th = torch.exp(self.log_threshold)
         return torch.clamp(th, self.min_threshold, self.max_threshold)
@@ -87,48 +108,39 @@ class AdaptiveSensingModule(nn.Module):
             return int(torch.round(s).item())
         return self.skip_steps
 
-    # --------------------------------------------------------------------- #
-    def forward(self, delta_input: torch.Tensor):
-        B, C, T = delta_input.shape
+    def forward(self, x: torch.Tensor):
+        B, C, T = x.shape
         P = self.patch_size
         assert T % P == 0, f"T={T} must be divisible by patch_size={P}"
         L = T // P
 
-        # --------------------------------------------------------------- #
-        # 1. 展开成 patch: [B, L, C, P]
-        # --------------------------------------------------------------- #
-        x_blocks = self._unfold(delta_input, size=P, step=P)  # [B, P, L]
+        x_blocks = self._unfold(x, size=P, step=P)  # [B, P, L]
         x_blocks = x_blocks.transpose(1, 2).contiguous()  # [B, L, P]
         x_blocks = x_blocks.view(B, L, C, P)  # [B, L, C, P]
 
-        # --------------------------------------------------------------- #
-        # 2. patch-level difference
-        # --------------------------------------------------------------- #
-        zeros = torch.zeros((B, 1, C, P), device=delta_input.device, dtype=delta_input.dtype)
+        # patch-level difference
+        zeros = torch.zeros((B, 1, C, P), device=x.device, dtype=x.dtype)
         prev_blocks = torch.cat([zeros, x_blocks[:, :-1]], dim=1)  # [B, L, C, P]
         delta_blocks = x_blocks - prev_blocks  # [B, L, C, P]
+        # # reshape fold to [B, C_in, T]
+        delta_x = delta_blocks.transpose(1, 2).contiguous()  # [B, L, C_in, P] → [B, C_in, L, P]
+        delta_x = delta_x.view(B, C, -1)  # [B, C_in, T]
 
-        # --------------------------------------------------------------- #
-        # 3. threshold & soft weight
-        # --------------------------------------------------------------- #
+        # threshold
         th = self.get_threshold()  # scalar
         abs_delta = torch.abs(delta_blocks)  # [B, L, C, P]
 
-        # 你可以选：mean / max / any
-        # 这里用 **mean over patch**（你原来用的）
+        # Calculate patch activity（mean over patch）
         patch_activity = abs_delta.mean(dim=-1)  # [B, L, C]
-        soft_weight = torch.sigmoid((patch_activity - th) / 3.0)  # [B, L, C]
 
-        # hard trigger: 整 patch 平均 < th → 触发
+        # hard trigger: entire patch average < th → trigger
         trigger = patch_activity < th  # [B, L, C]  bool
 
-        # --------------------------------------------------------------- #
-        # 4. skip logic (per patch, per channel)
-        # --------------------------------------------------------------- #
+        # skip logic (per patch, per channel)
         skip = self.get_skip_steps()  # int
 
         # patch index: [0,1,...,L-1]
-        patch_idx = torch.arange(L, device=delta_input.device)  # [L]
+        patch_idx = torch.arange(L, device=x.device)  # [L]
         patch_idx = patch_idx.view(1, L, 1).expand(B, L, C)  # [B, L, C]
 
         # skip_end: trigger → current_idx + skip
@@ -138,40 +150,45 @@ class AdaptiveSensingModule(nn.Module):
             torch.full_like(patch_idx, -1)
         )  # [B, L, C]
 
-        # cummax 沿 L 维度传播（每个 (B,C) 独立）
+        # cummax propagates along the L dimension (each (B,C) is independent)
         skip_end = torch.cummax(skip_end, dim=1).values  # [B, L, C]
 
         timer = torch.clamp(skip_end - patch_idx, min=0)  # [B, L, C]
         active_hard = (timer == 0).float()  # [B, L, C]
 
-        # --------------------------------------------------------------- #
-        # 5. Straight-Through Estimator
-        # --------------------------------------------------------------- #
-        active = active_hard + soft_weight - soft_weight.detach()  # [B, L, C]
+        active = active_hard  # [B, L, C]
 
-        # --------------------------------------------------------------- #
-        # 6. expand to pixel level: [B, L, C, P] → [B, C, T]
-        # --------------------------------------------------------------- #
-        mask_pixel = active.unsqueeze(-1).expand(-1, -1, -1, P)  # [B, L, C, P]
-        mask_pixel = mask_pixel.contiguous().view(B, C, T)  # [B, C, T]
+        # expand to pixel level: [B, L, C] → [B, C, L, P] → [B, C, T]
+        active_expanded = active_hard.unsqueeze(-1).expand(-1, -1, -1, P)  # [B, L, C, P]
+        # [B, L, C, P] → [B, C, L, P] → [B, C, T]
+        active_expanded = active_expanded.permute(0, 2, 1, 3).contiguous()  # [B, C, L, P]
+        mask_pixel = active_expanded.view(B, C, T)  # [B, C, T]
 
-        masked_delta = delta_input * mask_pixel
+        # Save prev_delta_x (pixel-level)
+        prev_delta_x = prev_blocks.permute(0, 2, 1, 3).contiguous().view(B, C, T)
 
-        # hard mask (0/1)
-        mask_hard = active_hard.unsqueeze(-1).expand(-1, -1, -1, P)
-        mask_hard = mask_hard.contiguous().view(B, C, T)
+        # Using Custom Gradients
+        masked_delta = BypassMaskGrad.apply(delta_x, mask_pixel, prev_delta_x)
+
+        # hard mask (0/1) - Apply the same dimensionality transformation
+        active_hard_expanded = active_hard.unsqueeze(-1).expand(-1, -1, -1, P)  # [B, L, C, P]
+        active_hard_expanded = active_hard_expanded.permute(0, 2, 1, 3).contiguous()  # [B, C, L, P]
+        mask_hard = active_hard_expanded.view(B, C, T)  # [B, C, T]
 
         # statistics
         active_mean = active.mean()
         active_ratio = active_hard.mean()
 
         # --------------------------------------------------------------- #
-        # Debug print (可删)
+        # Debug print
         # --------------------------------------------------------------- #
-        print("trigger[0]:", trigger[0])  # [L, C]
-        print("active_hard[0]:", active_hard[0])  # [L, C]
-        print("mask_pixel[0,0]:", mask_pixel[0, 0])  # [T]
-        print("masked_delta[0,0]:", masked_delta[0, 0])
+        # print(f"active_hard shape: {active_hard.shape}")  # [B, L, C]
+        # print(f"mask_pixel shape: {mask_pixel.shape}")  # [B, C, T]
+        # print(f"mask_hard shape: {mask_hard.shape}")  # [B, C, T]
+        # print(f"masked_delta shape: {masked_delta.shape}")  # [B, C, T]
+        # print(f"trigger[0]:", trigger[0])  # [L, C]
+        # print(f"active_hard[0]:", active_hard[0])  # [L, C]
+        # print("masked_delta[0,0]:", masked_delta[0, 0])
 
         return masked_delta, mask_hard, active_mean, active_ratio
 
@@ -213,10 +230,11 @@ class ConvTokenizer1D(nn.Module):
             delta_patches = self.conv(delta_x)  # [B, out_ch, L]
             patches = torch.cumsum(delta_patches, dim=-1)  # [B, out_ch, L]
 
+
             # # === test ===
             # original_patches = self.conv(x)
-            # print("no_SD:", original_patches[0, 0, :4])
-            # print("SD:   ", patches[0, 0, :4])
+            # print("no_SD:", original_patches[0, 0, :10])
+            # print("SD:   ", patches[0, 0, :10])
             # print("Max diff:", (original_patches - patches).abs().max().item())  # ~0
 
         patches = patches.transpose(1, 2)     # [B, L, out_ch]
@@ -356,7 +374,12 @@ class MultimodalActivityTransformer(nn.Module):
                 sensing_info['active_ratios'].append(active_ratio)
 
             # Tokenize masked input
-            t = self.sensor_tokenizers[str(device_idx)](ch)    # [B, L=10, out_ch=model_dim]
+            t = self.sensor_tokenizers[str(device_idx)](masked_ch)    # [B, L=10, out_ch=model_dim]
+
+            # original_t = self.sensor_tokenizers[str(device_idx)](ch, use_patch_block_sigma=False)
+            # print("no_SD:", original_t[0, :10, 0])
+            # print("SD:   ", t[0, :10, 0])
+
             per_sensor_tokens.append(t)           # keep [B, 10, model_dim]
 
         # optional modal dropout (now applied per sensor)
@@ -441,7 +464,7 @@ if __name__ == "__main__":
     ]
 
     model = build_former_device(num_classes=12, model_dim=32, return_mem=True, modalities=modalities,
-                                modal_fusion="cross_atten", init_threshold=0.8, skip_steps=5)
+                                modal_fusion="cross_atten", init_threshold=0.6, skip_steps=1)
     # print(model)
     logits, aux = model(x, history=history)
     print("logits:", logits.shape)          # expected [8, 12]

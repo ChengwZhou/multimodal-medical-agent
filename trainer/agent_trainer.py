@@ -29,7 +29,6 @@ from collections import deque, defaultdict
 
 # Import base components
 # from models.former_sensor import build_former
-from models.sigma_former import build_adaptive_sigma_former as build_former
 from models.former_device import build_former_device
 from models.agent_sensor_masking import SensorGatingAgent
 from models.agent_device_masking import DeviceGatingAgent
