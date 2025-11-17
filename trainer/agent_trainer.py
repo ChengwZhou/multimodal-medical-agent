@@ -28,7 +28,7 @@ import json
 from collections import deque, defaultdict
 
 # Import base components
-# from models.former_sensor import build_former
+from models.former_sensor import build_former
 from models.former_device import build_former_device
 from models.agent_sensor_masking import SensorGatingAgent
 from models.agent_device_masking import DeviceGatingAgent
@@ -1131,12 +1131,12 @@ if __name__ == "__main__":
         if args.use_fm_mdoel:
             model = build_FMformer(num_classes=num_classes, model_dim=512, return_mem=True, modalities=modalities)
         else:
-            # model = build_former(num_classes=num_classes, model_dim=512, return_mem=True, modalities=modalities, modal_fusion=args.modal_fusion)
-            model = build_former(num_classes=num_classes, model_dim=512, return_mem=True,
-                                                return_sensing_info=False,
-                                                skip_steps=5,
-                                                init_threshold=1e-7,
-                                                modalities=modalities, modal_fusion=args.modal_fusion)
+            model = build_former(num_classes=num_classes, model_dim=512, return_mem=True, modalities=modalities, modal_fusion=args.modal_fusion)
+            # model = build_former(num_classes=num_classes, model_dim=512, return_mem=True,
+            #                                     return_sensing_info=False,
+            #                                     skip_steps=5,
+            #                                     init_threshold=1e-7,
+            #                                     modalities=modalities, modal_fusion=args.modal_fusion)
         agent = SensorGatingAgent(num_modalities=num_modal, feature_dim=512)
 
     ddp_config = {}

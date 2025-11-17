@@ -216,8 +216,8 @@ class AgentSequentialTrainer:
             shuffle=(train_sampler is None),
             sampler=train_sampler,
             collate_fn=collate_sequential_batch,
-            num_workers=1,
-            pin_memory=True,
+            num_workers=4,
+            pin_memory=False,
             persistent_workers=True
         )
 
@@ -228,8 +228,8 @@ class AgentSequentialTrainer:
                 shuffle=False,
                 sampler=val_sampler,
                 collate_fn=collate_sequential_batch,
-                num_workers=1,
-                pin_memory=True,
+                num_workers=4,
+                pin_memory=False,
                 persistent_workers=True
             )
 
@@ -418,8 +418,8 @@ class AgentSequentialTrainer:
         # Process sequences in chunks of bptt_steps
         num_chunks = (max_seq_len + self.bptt_steps - 1) // self.bptt_steps
         # #
-        log_info(f"threshould1:, {torch.exp(model.adaptive_sensing['0'].log_threshold)}")
-        log_info(f"threshould2:, {torch.exp(model.adaptive_sensing['1'].log_threshold)}")
+        # log_info(f"threshould1:, {torch.exp(model.adaptive_sensing['0'].log_threshold)}")
+        # log_info(f"threshould2:, {torch.exp(model.adaptive_sensing['1'].log_threshold)}")
         # log_info(f"threshould3:, {torch.exp(model.adaptive_sensing['2'].log_threshold)}")
 
         for chunk_idx in range(num_chunks):
@@ -427,6 +427,9 @@ class AgentSequentialTrainer:
             start_idx = chunk_idx * self.bptt_steps
             end_idx = min(start_idx + self.bptt_steps, max_seq_len)
             chunk_size = end_idx - start_idx
+
+            if chunk_size <= 1:
+                continue
 
             # Zero gradients at start of each BPTT chunk
             self.model_optimizer.zero_grad(set_to_none=True)
