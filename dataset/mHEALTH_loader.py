@@ -26,7 +26,7 @@ class MHealthDataset(Dataset):
     Groups data by subject and maintains temporal order
     """
     def __init__(self, data_root: str, subjects: List[int], time_steps: int = 100, step: int = 50,
-                 balance: bool = False, majority_n: int = 30000, remove_zero_activity: bool = True):
+                 balance: bool = False, majority_n: int = 30000, remove_zero_activity: bool = True, max_channels: Optional[int] = None):
         """
         Args:
             data_root: Data directory path
@@ -44,7 +44,7 @@ class MHealthDataset(Dataset):
         self.balance = balance
         self.majority_n = majority_n
         self.remove_zero_activity = remove_zero_activity
-
+        self.max_channels = max_channels
         # Initialize subject_to_windows dictionary
         self.subject_to_windows = {}
         self.X, self.y = self._load_and_window()
@@ -109,9 +109,8 @@ class MHealthDataset(Dataset):
                         continue
                     label = most_common[0]
 
-                subject_Xs.append(x_window)
+                subject_Xs.append(x_window[:, :self.max_channels[0]])
                 subject_ys.append(label)
-
             # Store windows for this subject
             self.subject_to_windows[subject_id] = list(zip(subject_Xs, subject_ys))
             all_Xs.extend(subject_Xs)
@@ -154,7 +153,6 @@ class MHealthDataset(Dataset):
             shuffle_indices = np.random.permutation(len(Xs))
             Xs = Xs[shuffle_indices]
             ys = ys[shuffle_indices]
-
             # Invalidate subject_to_windows since balancing shuffles globally
             self.subject_to_windows = {sid: [] for sid in self.subjects}
             log_info("Balancing applied, subject_to_windows invalidated")
