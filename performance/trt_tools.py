@@ -300,7 +300,6 @@ def benchmark_all_engines(
             "num_modal",
             "activate_ratio",
             "patch_size",
-            "B",
             "T",
             "agent_ms",
             "tokenizer_ms",
@@ -361,3 +360,4 @@ if __name__ == "__main__":
         n_iters=50,
         gpu_index=0,
     )
+
