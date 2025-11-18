@@ -205,8 +205,8 @@ def export_three_blocks_to_onnx(
         opset_version=17,
         do_constant_folding=True,
         dynamic_axes={
-            "mem": {0: "batch_size", 1: "mem_len"},
-            "sensor_history": {0: "batch_size", 1: "history_len"},
+            "mem": {0: "batch_size"},
+            "sensor_history": {0: "batch_size"},
             "p_st": {0: "batch_size"},
         }
     )
@@ -223,9 +223,9 @@ def export_three_blocks_to_onnx(
         opset_version=17,
         do_constant_folding=True,
         dynamic_axes={
-            "window": {0: "batch_size", 2: "T"},
+            "window": {0: "batch_size"},
             "p_st": {0: "batch_size"},
-            "tokens": {0: "batch_size", 1: "tokens_len"},
+            "tokens": {0: "batch_size"},
         }
     )
     print(f"  -> Exported tokenizer block to {tokenizer_onnx_path}")
@@ -241,11 +241,11 @@ def export_three_blocks_to_onnx(
         opset_version=17,
         do_constant_folding=True,
         dynamic_axes={
-            "tokens": {0: "batch_size", 1: "tokens_len"},
-            "mem_context": {0: "batch_size", 1: "mem_len"},
-            "mem_context_mask": {0: "batch_size", 1: "mem_mask_len"},
+            "tokens": {0: "batch_size"},
+            "mem_context": {0: "batch_size"},
+            "mem_context_mask": {0: "batch_size"},
             "logits": {0: "batch_size"},
-            "mem_new": {0: "batch_size", 1: "tokens_len"},
+            "mem_new": {0: "batch_size"},
         }
     )
     print(f"  -> Exported transformer block to {transformer_onnx_path}")
