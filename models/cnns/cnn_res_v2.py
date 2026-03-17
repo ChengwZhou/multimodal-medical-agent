@@ -66,9 +66,9 @@ class CNN1DResidualV2(nn.Module):
     def __init__(self, num_classes: int, num_modal: int = 14):
         super().__init__()
         self.num_modal = num_modal
-        # 14 个模态各自一个分支
+
         self.branches = nn.ModuleList([CNNBranch() for _ in range(num_modal)])
-        # 分类头，输入通道 = 256 * 14
+
         self.fc = nn.Sequential(
             nn.Linear(256 * num_modal, 128),
             nn.ReLU(inplace=True),

@@ -4,6 +4,7 @@ import argparse
 import os
 from typing import List, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -16,7 +17,7 @@ from models.FMformer import build_FMformer
 
 from dataset.mHEALTH_loader import MHealthDataset
 from dataset.ScientISST_MOVE_loader import split_by_subject, filter_labels, ScientISSTMOVEDataset
-# from dataset.WESAD_loader import MultiModalWESADDataset, wesad_split_by_subject
+from dataset.WESAD_loader import WESADDataset, wesad_split_by_subject
 from dataset.IMU_loader import IMUDataset
 from dataset.hmc_loader import HMCSleepDataset
 
@@ -324,7 +325,7 @@ def main():
         )
         val_subset = HMCSleepDataset(
             data_root=args.data_root,
-            subjects=val_subset,
+            subjects=val_subjects,
             balance=False,
             remove_wake=False,
             apply_notch=True, notch_freq=50.0,
@@ -346,44 +347,44 @@ def main():
             ModalityConfig(f'm{i}', 1, 30, 0) for i in range(num_modal)
         ]
 
-    # elif args.dataset == 'wesad':
-    #     dataset = MultiModalWESADDataset(
-    #         root=args.data_root,
-    #     )
-    #
-    #     train_idx, val_idx = wesad_split_by_subject(dataset, val_ratio=0.1)
-    #     num_classes = len(dataset.label_map)
-    #
-    #     train_subset = Subset(dataset, train_idx)
-    #     val_subset = Subset(dataset, val_idx)
-    #
-    #     train_sampler = DistributedSampler(
-    #         train_subset, num_replicas=world_size, rank=rank, shuffle=True
-    #     ) if world_size > 1 else None
-    #     val_sampler = DistributedSampler(
-    #         val_subset, num_replicas=world_size, rank=rank, shuffle=False
-    #     ) if world_size > 1 else None
-    #
-    #     train_loader = DataLoader(
-    #         train_subset,
-    #         batch_size=args.batch_size,
-    #         sampler=train_sampler,
-    #         shuffle=(train_sampler is None),
-    #         num_workers=args.num_workers,
-    #         pin_memory=True,
-    #         collate_fn=simple_collate,
-    #         drop_last=False
-    #     )
-    #     val_loader = DataLoader(
-    #         val_subset,
-    #         batch_size=args.batch_size,
-    #         sampler=val_sampler,
-    #         shuffle=False,
-    #         num_workers=args.num_workers,
-    #         pin_memory=True,
-    #         collate_fn=simple_collate,
-    #         drop_last=False
-    #     )
+    elif args.dataset == 'wesad':
+        dataset = WESADDataset(
+            root=args.data_root,
+        )
+
+        train_idx, val_idx = wesad_split_by_subject(dataset, val_ratio=0.1)
+        num_classes = len(dataset.label_map)
+
+        train_subset = Subset(dataset, train_idx)
+        val_subset = Subset(dataset, val_idx)
+
+        train_sampler = DistributedSampler(
+            train_subset, num_replicas=world_size, rank=rank, shuffle=True
+        ) if world_size > 1 else None
+        val_sampler = DistributedSampler(
+            val_subset, num_replicas=world_size, rank=rank, shuffle=False
+        ) if world_size > 1 else None
+
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            shuffle=(train_sampler is None),
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=simple_collate,
+            drop_last=False
+        )
+        val_loader = DataLoader(
+            val_subset,
+            batch_size=args.batch_size,
+            sampler=val_sampler,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=simple_collate,
+            drop_last=False
+        )
 
     elif args.dataset == 'imu':
         train_subjects = ['15','16','17','18','20']

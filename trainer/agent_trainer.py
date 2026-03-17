@@ -48,7 +48,7 @@ from dataset.sequential_dataset import (
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
 from dataset.mHEALTH_loader import MHealthDataset
 from dataset.hmc_loader import HMCSleepDataset
-from dataset.WESAD_loader import MultiModalWESADDataset
+from dataset.WESAD_loader import WESADDataset
 from utils.metrics import compute_metrics, print_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -96,7 +96,8 @@ class AgentSequentialTrainer:
             # DDP settings
             ddp_rank: Optional[int] = None,
             ddp_world_size: Optional[int] = None,
-            ddp_port: str = "12355"
+            ddp_port: str = "12355",
+            cls_weights=None,
     ):
         self.model = model
         self.agent = agent
@@ -975,6 +976,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', type=str, default='siscientisst')
     parser.add_argument('--root', type=str,
                         default='/Users/chengweizhou/PycharmProjects/data/scientisst-move-annotated-wearable-multimodal-biosignals-recorded-during-everyday-life-activities-in-naturalistic-environments-1.0.1')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints')
     parser.add_argument('--model_lr', type=float, default=3e-4)
     parser.add_argument('--agent_lr', type=float, default=3e-4)
     parser.add_argument('--batch_size', type=int, default=12)
@@ -1011,6 +1013,7 @@ if __name__ == "__main__":
     is_distributed = world_size > 1
 
     data_root = args.root
+    weights = None
     if args.dataset == "siscientisst":
         dataset = ScientISSTMOVEDataset(root=data_root, window_sec=args.window_sec, stride_sec=args.stride_sec,
                                         none_policy="ignore")
@@ -1035,22 +1038,23 @@ if __name__ == "__main__":
                 ModalityConfig('w', 6, 10, 2),
             ]
     elif args.dataset == "mhealth":
-        dataset = MHealthDataset(args.root, subjects=[i for i in range(0, 11)], time_steps=100, step=50,
-                                 balance=False, majority_n=500)
+        dataset = MHealthDataset(args.root, subjects=[i for i in range(0, 11)], time_steps=50, step=25,
+                                 balance=False, majority_n=500, sample_rate=25)
         train_subjects = [i for i in range(1, 8)]
         val_subjects = [8, 9, 10]
         num_classes = 12
         weights = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
         weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
-        num_modal = 12
+        num_modal = 13
         if not args.use_device_wise_model:
             modalities = [
                 ModalityConfig(f'm{i}', 1, 10, 0) for i in range(num_modal)
             ]
         else:
             modalities = [
-                ModalityConfig('al', 3, 10, 0), ModalityConfig('gl', 3, 10, 0),
-                ModalityConfig('ar', 3, 10, 1), ModalityConfig('gr', 3, 10, 1),
+                ModalityConfig('ecg', 1, 5, 2),
+                ModalityConfig('al', 3, 5, 0), ModalityConfig('gl', 3, 5, 0),
+                ModalityConfig('ar', 3, 5, 1), ModalityConfig('gr', 3, 5, 1),
             ]
     elif args.dataset == "hmc":
         global_stats = {"mean": np.array([9.1890168e-01, 1.9557451e+00, 2.4014959e+00, 1.6120193e+00,
@@ -1096,23 +1100,28 @@ if __name__ == "__main__":
             ModalityConfig(f'm{i}', 1, 30, 0) for i in range(num_modal)
         ]
     elif args.dataset == "wesad":
-        dataset = MultiModalWESADDataset(args.root, [2,3], window_sec=10, target_fs=64)
+        # dataset = WESADDataset(args.root, [2,3,4,5,6,7,8,9,10,11,13,14,15,16,17], window_sec=1, target_fs=100)
+        # train_subjects = [2,3,4,5,6,7,8,9,10,11,13,14]
+        # val_subjects = [15,16,17]
+        dataset = WESADDataset(args.root, [2, 17], window_sec=30, step_sec=15, target_fs=100)
         train_subjects = [2]
-        val_subjects = [3]
+        val_subjects = [17]
         num_classes = 3
         num_modal = 14
         if not args.use_device_wise_model:
             modalities = [
-                # RespiBAN chest sensor (device 0)
-                ModalityConfig('chest_acc', 3, 10, 0),
                 ModalityConfig('chest_ecg', 1, 10, 0),
                 ModalityConfig('chest_emg', 1, 10, 0),
                 ModalityConfig('chest_eda', 1, 10, 0),
-                ModalityConfig('chest_temp', 1, 10, 0),
                 ModalityConfig('chest_resp', 1, 10, 0),
+                ModalityConfig('chest_temp', 1, 10, 0),
+                ModalityConfig('chest_acc_x', 1, 10, 0),
+                ModalityConfig('chest_acc_y', 1, 10, 0),
+                ModalityConfig('chest_acc_z', 1, 10, 0),
 
-                # Empatica E4 wrist sensor (device 1)
-                ModalityConfig('wrist_acc', 3, 10, 1),
+                ModalityConfig('wrist_acc_x', 1, 10, 1),
+                ModalityConfig('wrist_acc_y', 1, 10, 1),
+                ModalityConfig('wrist_acc_z', 1, 10, 1),
                 ModalityConfig('wrist_bvp', 1, 10, 1),
                 ModalityConfig('wrist_eda', 1, 10, 1),
                 ModalityConfig('wrist_temp', 1, 10, 1),
@@ -1123,6 +1132,9 @@ if __name__ == "__main__":
                 ModalityConfig('chest', 8, 10, 0),
                 ModalityConfig('wrist', 6, 10, 1),
             ]
+
+        weights = torch.tensor([0.6, 1, 2])
+        weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
 
     if args.use_device_wise_model:
         model = build_former_device(num_classes=num_classes, model_dim=512, return_mem=True, modalities=modalities, modal_fusion=args.modal_fusion)
@@ -1154,6 +1166,7 @@ if __name__ == "__main__":
         model=model,
         agent=agent,
         trainer_config={
+            "save_dir": args.save_dir,
             "batch_size": args.batch_size,
             "bptt_steps": args.bptt_steps,
             "ce_weight": args.ce_weight,
@@ -1171,7 +1184,8 @@ if __name__ == "__main__":
             "use_predictive_loss": args.use_predictive_loss,
             "predictive_weight": args.predictive_weight,
             "predictive_offset": args.predictive_offset,
-            "only_predictive": args.only_predictive
+            "only_predictive": args.only_predictive,
+            "cls_weights": None
         },
         ddp_config=ddp_config
     )

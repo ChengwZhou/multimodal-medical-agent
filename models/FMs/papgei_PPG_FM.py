@@ -636,7 +636,7 @@ if __name__ == "__main__":
     )
 
     # print("✅ Model Structure")
-    # print(model)
+    print(model)
 
     local_path = "/Users/chengweizhou/PycharmProjects/data/papagei_s.pt"
     load_checkpoint_to_model(model, local_path, map_location="cpu")

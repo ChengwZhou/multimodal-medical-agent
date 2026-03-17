@@ -33,7 +33,7 @@ import argparse
 from models.former_sensor import build_former
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
 from dataset.hmc_loader import HMCSleepDataset
-from dataset.WESAD_loader import MultiModalWESADDataset
+from dataset.WESAD_loader import WESADDataset
 from utils.metrics import compute_metrics, print_metrics
 
 

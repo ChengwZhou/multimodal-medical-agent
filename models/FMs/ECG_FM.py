@@ -518,6 +518,7 @@ if __name__ == "__main__":
         adaptation_method="zero_pad",
         lead_index=0  # Lead I
     )
+    print(model_single_zeropad)
     single_lead_data = torch.randn(2, 1, 1600)  # Lead I data
     output = model_single_zeropad(single_lead_data, return_embeddings=True)
     print(f"Input: {single_lead_data.shape} -> Output: {output.shape}")

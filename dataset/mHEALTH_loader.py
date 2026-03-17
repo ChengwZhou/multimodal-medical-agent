@@ -26,7 +26,8 @@ class MHealthDataset(Dataset):
     Groups data by subject and maintains temporal order
     """
     def __init__(self, data_root: str, subjects: List[int], time_steps: int = 100, step: int = 50,
-                 balance: bool = False, majority_n: int = 30000, remove_zero_activity: bool = True):
+                 balance: bool = False, majority_n: int = 30000, remove_zero_activity: bool = True,
+                 sample_rate: int = 50):
         """
         Args:
             data_root: Data directory path
@@ -44,6 +45,10 @@ class MHealthDataset(Dataset):
         self.balance = balance
         self.majority_n = majority_n
         self.remove_zero_activity = remove_zero_activity
+
+        if 50 % sample_rate != 0:
+            raise ValueError(f"sample_rate={sample_rate} 必须能整除 50（MHEALTH原始采样率）")
+        self.downsample_step = 50 // sample_rate  # e.g. 25Hz → 2; 10Hz → 5
 
         # Initialize subject_to_windows dictionary
         self.subject_to_windows = {}
@@ -67,8 +72,9 @@ class MHealthDataset(Dataset):
             # Load data
             df = pd.read_csv(path, header=None, sep="\t")
             # Select feature columns (same as original)
-            df = df.loc[:, [5, 6, 7, 8, 9, 10, 14, 15, 16, 17, 18, 19, 23]]
+            df = df.loc[:, [1, 5, 6, 7, 8, 9, 10, 14, 15, 16, 17, 18, 19, 23]]
             df = df.rename(columns={
+                1: "ECG",
                 5: "alx", 6: "aly", 7: "alz",
                 8: "glx", 9: "gly", 10: "glz",
                 14: "arx", 15: "ary", 16: "arz",
@@ -92,6 +98,11 @@ class MHealthDataset(Dataset):
             # Apply sliding window
             X = df.drop(['Activity'], axis=1)
             y = df['Activity']
+
+            # === 新增：下采样（只取每 downsample_step 个点）===
+            X = X.iloc[::self.downsample_step].reset_index(drop=True)
+            y = y.iloc[::self.downsample_step].reset_index(drop=True)
+
             subject_Xs, subject_ys = [], []
 
             for i in range(0, len(X) - self.time_steps + 1, self.step):
@@ -295,7 +306,7 @@ if __name__ == "__main__":
 
         base_dataset = MHealthDataset(
             data_root=data_root,
-            subjects=[1],  # 只测一个 subject 加快速度
+            subjects=[1],
             time_steps=100,
             step=50,
             balance=False,
@@ -304,7 +315,6 @@ if __name__ == "__main__":
         seq_dataset = SequentialDataset(base_dataset, subject_ids=[1])
         loader = DataLoader(seq_dataset, batch_size=1, shuffle=False, collate_fn=collate_sequential_batch)
 
-        # 取第一个 batch
         batch = next(iter(loader))
         x_orig = batch.sequences[0]  # [C, max_T]
         y_orig = batch.labels[0]
@@ -314,7 +324,6 @@ if __name__ == "__main__":
         print(f"   Sequence length: {lengths}")
         print(f"   Label sequence: {y_orig[:10].tolist()}...")
 
-        # 取第一个模态第一个时间步
         signal_orig = x_orig[0, 0, :10]  # [T]
         print(signal_orig)
         print(f"   First modality range: [{signal_orig.min():.4f}, {signal_orig.max():.4f}]")
@@ -328,7 +337,7 @@ if __name__ == "__main__":
         print("\n2. Testing WITH DeltaDataset...")
         start_time = time.time()
 
-        delta_dataset = DeltaDataset(base_dataset, axis=-1)  # 沿时间轴差分
+        delta_dataset = DeltaDataset(base_dataset, axis=-1)
         seq_delta_dataset = SequentialDataset(delta_dataset, subject_ids=[1])
         delta_loader = DataLoader(seq_delta_dataset, batch_size=1, shuffle=False, collate_fn=collate_sequential_batch)
 

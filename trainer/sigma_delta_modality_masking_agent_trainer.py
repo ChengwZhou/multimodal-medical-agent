@@ -51,7 +51,7 @@ from dataset.delta_dataset import DeltaDataset
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
 from dataset.mHEALTH_loader import MHealthDataset
 from dataset.hmc_loader import HMCSleepDataset
-from dataset.WESAD_loader import MultiModalWESADDataset
+from dataset.WESAD_loader import WESADDataset
 
 from utils.metrics import compute_metrics, print_metrics
 
@@ -216,7 +216,7 @@ class AgentSequentialTrainer:
             shuffle=(train_sampler is None),
             sampler=train_sampler,
             collate_fn=collate_sequential_batch,
-            num_workers=4,
+            num_workers=2,
             pin_memory=False,
             persistent_workers=True
         )
@@ -228,7 +228,7 @@ class AgentSequentialTrainer:
                 shuffle=False,
                 sampler=val_sampler,
                 collate_fn=collate_sequential_batch,
-                num_workers=4,
+                num_workers=2,
                 pin_memory=False,
                 persistent_workers=True
             )
@@ -985,6 +985,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', type=str, default='siscientisst')
     parser.add_argument('--root', type=str,
                         default='/Users/chengweizhou/PycharmProjects/data/scientisst-move-annotated-wearable-multimodal-biosignals-recorded-during-everyday-life-activities-in-naturalistic-environments-1.0.1')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints')
     parser.add_argument('--model_lr', type=float, default=3e-4)
     parser.add_argument('--agent_lr', type=float, default=3e-4)
     parser.add_argument('--batch_size', type=int, default=12)
@@ -1055,13 +1056,14 @@ if __name__ == "__main__":
         num_classes = 12
         weights = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
         weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
-        num_modal = 12
+        num_modal = 13
         if not args.use_device_wise_model:
             modalities = [
                 ModalityConfig(f'm{i}', 1, 10, 0) for i in range(num_modal)
             ]
         else:
             modalities = [
+                ModalityConfig('ecg', 1, 10, 2),
                 ModalityConfig('al', 3, 10, 0), ModalityConfig('gl', 3, 10, 0),
                 ModalityConfig('ar', 3, 10, 1), ModalityConfig('gr', 3, 10, 1),
             ]
@@ -1109,23 +1111,25 @@ if __name__ == "__main__":
             ModalityConfig(f'm{i}', 1, 30, 0) for i in range(num_modal)
         ]
     elif args.dataset == "wesad":
-        dataset = MultiModalWESADDataset(args.root, [2,3], window_sec=10, target_fs=64)
-        train_subjects = [2]
-        val_subjects = [3]
+        dataset = WESADDataset(args.root, [2,3,4,5,6,7,8,9,10,11,13,14,15,16,17], window_sec=1, target_fs=100)
+        train_subjects = [2,3,4,5,6,7,8,9,10,11,13,14]
+        val_subjects = [15,16,17]
         num_classes = 3
         num_modal = 14
         if not args.use_device_wise_model:
             modalities = [
-                # RespiBAN chest sensor (device 0)
-                ModalityConfig('chest_acc', 3, 10, 0),
                 ModalityConfig('chest_ecg', 1, 10, 0),
                 ModalityConfig('chest_emg', 1, 10, 0),
                 ModalityConfig('chest_eda', 1, 10, 0),
-                ModalityConfig('chest_temp', 1, 10, 0),
                 ModalityConfig('chest_resp', 1, 10, 0),
+                ModalityConfig('chest_temp', 1, 10, 0),
+                ModalityConfig('chest_acc_x', 1, 10, 0),
+                ModalityConfig('chest_acc_y', 1, 10, 0),
+                ModalityConfig('chest_acc_z', 1, 10, 0),
 
-                # Empatica E4 wrist sensor (device 1)
-                ModalityConfig('wrist_acc', 3, 10, 1),
+                ModalityConfig('wrist_acc_x', 1, 10, 1),
+                ModalityConfig('wrist_acc_y', 1, 10, 1),
+                ModalityConfig('wrist_acc_z', 1, 10, 1),
                 ModalityConfig('wrist_bvp', 1, 10, 1),
                 ModalityConfig('wrist_eda', 1, 10, 1),
                 ModalityConfig('wrist_temp', 1, 10, 1),
@@ -1173,6 +1177,7 @@ if __name__ == "__main__":
         model=model,
         agent=agent,
         trainer_config={
+            "save_dir": args.save_dir,
             "batch_size": args.batch_size,
             "bptt_steps": args.bptt_steps,
             "ce_weight": args.ce_weight,

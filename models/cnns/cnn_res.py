@@ -41,7 +41,7 @@ class CNN1DResidual(nn.Module):
         out = self.fc(feats)
         return out
 
-# 例子
+
 if __name__ == "__main__":
     model = CNN1DResidual(num_modal=12, in_len=100, num_classes=6)
     x = torch.randn(8, 12, 100)

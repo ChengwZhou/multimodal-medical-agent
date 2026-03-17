@@ -119,11 +119,9 @@ def collate_sequential_batch_sync(batch, global_max_len):
     if batch_size == 0:
         return None
 
-    # 取第一个非空序列的形状
     first_valid = next(s for s in sequences if len(s) > 0)
     C, T = first_valid[0][0].shape
 
-    # 在 CPU 上创建 padded tensor
     padded_seqs = torch.zeros(batch_size, global_max_len, C, T, dtype=torch.float32)  # CPU
     padded_labels = torch.full((batch_size, global_max_len), -100, dtype=torch.long)  # CPU
 
