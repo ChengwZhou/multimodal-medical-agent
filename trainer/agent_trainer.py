@@ -47,6 +47,7 @@ from dataset.sequential_dataset import (
 )
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
 from dataset.mHEALTH_loader import MHealthDataset
+from dataset.Kinematics_loader import KinematicsDataset
 from dataset.hmc_loader import HMCSleepDataset
 from dataset.WESAD_loader import WESADDataset
 from utils.metrics import compute_metrics, print_metrics
@@ -1135,6 +1136,46 @@ if __name__ == "__main__":
 
         weights = torch.tensor([0.6, 1, 2])
         weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
+
+
+
+    elif args.dataset == "kinematics":
+        from dataset.Kinematics_loader import KinematicsDataset
+        
+        # Configuration for kinematics dataset
+        num_modal = 39  # 30 IMU + 9 VICON signals
+        num_classes = 10  # 10 perturbation types
+        
+        
+        if not args.use_device_wise_model:
+            # Each signal as separate modality 
+            modalities = [
+                ModalityConfig(f'signal_{i}', 1, 10, 0) for i in range(num_modal)
+            ]
+        else:
+            # Device-wise grouping (2 modalities: IMU and VICON)
+            modalities = [
+                ModalityConfig('imu', 30, 10, 0),   # 30 IMU signals
+                ModalityConfig('vicon', 9, 10, 1),  # 9 VICON signals
+            ]
+        
+        # Subject split (10 subjects total: HAB-15 to HAB-24)
+        all_subjects = list(range(15, 25))  # 15-24 inclusive
+        train_subjects = list(range(15, 23))  # 15-22
+        val_subjects = [23, 24]  # 23-24
+        
+        # Create base dataset
+        dataset = KinematicsDataset(
+            data_root=args.root,
+            subjects=all_subjects,
+            time_steps=100,  # 1 second at 100 Hz
+            step=50,         
+            balance=False,   
+        )
+        
+        weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.8])
+        weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
+
 
     if args.use_device_wise_model:
         model = build_former_device(num_classes=num_classes, model_dim=512, return_mem=True, modalities=modalities, modal_fusion=args.modal_fusion)
