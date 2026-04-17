@@ -1,630 +1,560 @@
 import os
+import re
 import numpy as np
-import scipy.io
-import logging
-from torch.utils.data import Dataset, DataLoader
 import torch
-from collections import Counter
-from typing import List, Tuple, Optional
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import LabelEncoder
+from scipy.io import loadmat
+from scipy.signal import butter, filtfilt, resample
+from typing import List, Tuple
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-def log_info(msg: str) -> None:
-    """Rank-0-only logging, compatible with DDP (mirrors mHEALTH_loader.py)."""
-    from torch.distributed import is_initialized, get_rank
-    if not is_initialized() or get_rank() == 0:
-        logger.info(msg)
-
-# ---------------------------------------------------------------------------
-# IMU column layout
-# ---------------------------------------------------------------------------
-# The raw IMU array has 70 columns: 7 sensors x 10 signals each.
-# Signal order per sensor: Accx Accy Accz Gyrox Gyroy Gyroz Ori_i Ori_j Ori_k <unused>
-# We keep only acc+gyro (first 6 per sensor) for sensors 1-5 (indices 0-4).
-# Sensors 6-7 (columns 50-69) are never used and are always omitted.
-#
-# This gives the correct 30 columns:
-#   Sensor 1 (right thigh)  -> raw cols  0- 5
-#   Sensor 2 (right shank)  -> raw cols 10-15
-#   Sensor 3 (left shank)   -> raw cols 20-25
-#   Sensor 4 (left thigh)   -> raw cols 30-35
-#   Sensor 5 (torso)        -> raw cols 40-45
-#
-# IMPORTANT: naively slicing [:, :30] would grab cols 0-29, which mixes
-# orientation data from sensors 1-3 and misses sensors 4 and 5 entirely.
-# The correct approach is to stride-select 6 columns from each sensor block.
-
-IMU_SENSOR_COLS: List[int] = []
-for _s in range(5):          # sensors 1-5 (0-indexed)
-    _base = _s * 10
-    IMU_SENSOR_COLS.extend(range(_base, _base + 6))   # acc + gyro only
-# Result: [0,1,2,3,4,5, 10,11,12,13,14,15, 20,21,22,23,24,25, 30,31,32,33,34,35, 40,41,42,43,44,45]
-
-NUM_IMU_CHANNELS   = len(IMU_SENSOR_COLS)              # 30
-NUM_VICON_CHANNELS = 9                                  # COMx/y/z + 6 joint angles
-NUM_ALL_CHANNELS   = NUM_IMU_CHANNELS + NUM_VICON_CHANNELS  # 39
-
-# Sensors 4 & 5 are the ones that failed on HAB-17.
-# After column selection their positions in the 30-channel output are:
-#   sensor 4 (left thigh) -> output cols 18-23
-#   sensor 5 (torso)      -> output cols 24-29
-HAB17_BAD_SENSOR_COLS = list(range(18, 30))
-
-# Subjects with known sensor faults -> map to which output cols to zero-fill.
-# Extend this dict if you discover other subjects with hardware issues.
-SUBJECTS_WITH_MISSING_SENSORS = {
-    17: HAB17_BAD_SENSOR_COLS,
-}
-
-
-class KinematicsDataset(Dataset):
+class IMUKinematicsDataset(Dataset):
     """
-    Dataset for the HAB perturbation study ("Data with Kinematics").
-
-    Directory layout:
-
-        data_root/
-            HAB-15/
-                QS_F_1.mat
-                QS_B_1.mat
-                HS_B_Left_1.mat
-                ...
-            HAB-16/
-                ...
-
-    Each .mat file contains MATLAB cell arrays:
-        IMU_perturbation_data   - (1, n_reps), each cell [N_imu  x 70]  @ 1000 Hz
-        VICON_perturbation_data - (1, n_reps), each cell [N_vicon x  9]  @  100 Hz
-
-    IMU is downsampled to 100 Hz to match VICON, then the two are concatenated
-    into a 39-channel feature vector [acc+gyro (30) | COM+angles (9)].
-
-    Windows are labelled by perturbation type derived from the filename.
-    The dataset preserves per-subject temporal order via subject_to_windows
-    so that SequentialDataset + BPTT in agent_trainer.py work correctly.
-
-    Args:
-        data_root:                   Root directory (one sub-folder per participant).
-        subjects:                    Integer subject IDs, e.g. [15, 16, 17].
-        time_steps:                  Sliding window length in samples (at 100 Hz).
-        step:                        Sliding window stride in samples.
-        balance:                     Downsample majority class to majority_n windows.
-        majority_n:                  Target size for majority-class downsampling.
-        remove_short_perturbations:  Drop individual repetitions shorter than min_length.
-        min_length:                  Minimum repetition length (samples at 100 Hz).
+    Dataset loader for IMU + VICON kinematics perturbation data.
+    
+    Data structure per .mat file:
+    - IMU_perturbation_data: cell array of perturbations, each shape (T, 70)
+      Columns 0-49: First 5 sensors (each sensor: AccX, AccY, AccZ, GyroX, GyroY, GyroZ, +4 orientation cols)
+      We keep only first 6 columns per sensor (acc + gyro) -> 5 sensors × 6 = 30 columns
+    - VICON_perturbation_data: cell array of perturbations, each shape (T, 9)
+      Columns: COMx, COMy, COMz, L_hip_angle, L_knee_angle, L_ankle_angle,
+               R_hip_angle, R_knee_angle, R_ankle_angle
+    
+    Sensor locations:
+    1 - Right thigh
+    2 - Right shank
+    3 - Left shank
+    4 - Left thigh
+    5 - Torso
     """
-
-    def __init__(
-        self,
-        data_root: str,
-        subjects: List[int],
-        time_steps: int = 100,
-        step: int = 50,
-        balance: bool = False,
-        majority_n: int = 30000,
-        remove_short_perturbations: bool = True,
-        min_length: int = 100,
-    ):
-        self.data_root   = data_root
-        self.subjects    = sorted(subjects)
-        self.time_steps  = time_steps
-        self.step        = step
-        self.balance     = balance
-        self.majority_n  = majority_n
-        self.remove_short_perturbations = remove_short_perturbations
-        self.min_length  = min_length
-
-        self.label_map         = self._create_label_map()
-        self.inverse_label_map = {v: k for k, v in self.label_map.items()}
-
-        # subject_id (int) -> [(window_np [T, C], label_int), ...]
-        # Populated during _load_and_window; used by get_subject_sequence().
-        self.subject_to_windows: dict = {}
-
-        self.X, self.y = self._load_and_window()
-
-    # ------------------------------------------------------------------
-    # Label helpers
-    # ------------------------------------------------------------------
-
-    def _create_label_map(self) -> dict:
-        """Fixed integer label for each perturbation type (0-indexed, stable)."""
-        perturbation_types = [
-            "QS_F",       # 0 - quiet standing, fall forwards
-            "QS_B",       # 1 - quiet standing, fall backwards
-            "HS_B_Left",  # 2 - heel-strike, left leg pulled forward
-            "HS_B_Right", # 3 - heel-strike, right leg pulled forward
-            "TO_F_Left",  # 4 - toe-off, left leg pulled backward
-            "TO_F_Right", # 5 - toe-off, right leg pulled backward
-            "MS_F_Left",  # 6 - mid-stance, left, fall forwards
-            "MS_F_Right", # 7 - mid-stance, right, fall forwards
-            "MS_B_Left",  # 8 - mid-stance, left, fall backwards
-            "MS_B_Right", # 9 - mid-stance, right, fall backwards
-        ]
-        return {ptype: idx for idx, ptype in enumerate(perturbation_types)}
-
-    def _extract_label_from_filename(self, filename: str) -> str:
+    
+    # Perturbation type mapping based on README
+    PERTURBATION_TYPES = [
+        'QS_F',          # quiet standing, falls forward
+        'QS_B',          # quiet standing, falls backward
+        'HS_B_Left',     # heel-strike, left leg pulled forward
+        'HS_B_Right',    # heel-strike, right leg pulled forward
+        'TO_F_Left',     # toe-off, left leg pulled backward
+        'TO_F_Right',    # toe-off, right leg pulled backward
+        'MS_F_Left',     # mid-stance, left leg falls forward
+        'MS_F_Right',    # mid-stance, right leg falls forward
+        'MS_B_Left',     # mid-stance, left leg falls backward
+        'MS_B_Right'     # mid-stance, right leg falls backward
+    ]
+    
+    def __init__(self, root="Data", subject_numbers=None, pert_window=6000,
+                 num_imus=5, label_encoder=None, fs=100,
+                 lowcut=0.1, highcut=20, apply_filter=True,
+                 use_imu=True, use_kinematics=True, normalize=True):
         """
-        Strip the trial-number suffix and extension to get the perturbation key.
-
-        Examples:
-            "HS_B_Left_1.mat"   -> "HS_B_Left"
-            "TO_F_Right_2.mat"  -> "TO_F_Right"
-            "QS_F_1.mat"        -> "QS_F"
-            "MS_B_Right.mat"    -> "MS_B_Right"   (no suffix - also handled)
+        Args:
+            root: Root directory containing HAB-XX folders
+            subject_numbers: List of subject IDs as strings (e.g., ['15','16','17'])
+            pert_window: Target window length for resampling perturbations
+            num_imus: Number of IMU sensors to use (max 5)
+            label_encoder: Optional fitted LabelEncoder for consistent label encoding
+            fs: Sampling frequency in Hz
+            lowcut, highcut: Bandpass filter cutoff frequencies
+            apply_filter: Whether to apply bandpass filter to IMU data
+            use_imu: Include IMU data in the output
+            use_kinematics: Include VICON kinematics data in the output
+            normalize: Apply z-score normalization per perturbation
         """
-        name  = os.path.splitext(filename)[0]   # drop .mat
-        parts = name.split('_')
-        if parts[-1].isdigit():
-            parts = parts[:-1]
-        return '_'.join(parts)
+        self.root = root
+        self.pert_window = pert_window
+        self.num_imus = num_imus
+        self.fs = fs
+        self.lowcut = lowcut
+        self.highcut = highcut
+        self.apply_filter = apply_filter
+        self.use_imu = use_imu
+        self.use_kinematics = use_kinematics
+        self.normalize = normalize
+        
+        # Calculate channel dimensions
+        self.imu_channels = num_imus * 6  # 6 channels per IMU (AccX,Y,Z + GyroX,Y,Z)
+        self.kinematics_channels = 9  # 9 VICON channels
+        self.num_channels = 0
+        if use_imu:
+            self.num_channels += self.imu_channels
+        if use_kinematics:
+            self.num_channels += self.kinematics_channels
+        
+        self.X_imu = []
+        self.X_kinematics = []
+        self.Y = []
+        self.subject_ids = []
+        self.perturbation_ids = []
+        
+        if subject_numbers is None:
+            subject_numbers = []
+        
+        # Statistics for normalization
+        self.imu_mean = None
+        self.imu_std = None
+        self.kinematics_mean = None
+        self.kinematics_std = None
+        
+        # Load all data
+        self._load_data(subject_numbers)
+        
+        # Convert to arrays
+        if use_imu:
+            self.X_imu = np.array(self.X_imu, dtype=np.float32)
+        if use_kinematics:
+            self.X_kinematics = np.array(self.X_kinematics, dtype=np.float32)
+        
+        # Handle label encoding
+        if label_encoder is None:
+            self.le = LabelEncoder()
+            self.Y = self.le.fit_transform(self.Y)
+        else:
+            self.le = label_encoder
+            self.Y = self.le.transform(self.Y)
+        
+        self.Y = np.array(self.Y, dtype=np.int64)
+        
+        # Compute normalization statistics if requested
+        if normalize and len(self.X_imu) > 0:
+            self._compute_normalization_stats()
+            self._apply_normalization()
 
-    # ------------------------------------------------------------------
-    # Signal processing
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _select_imu_channels(imu_raw: np.ndarray) -> np.ndarray:
-        """
-        Extract acc+gyro (6 channels) from each of the 5 used sensors.
-
-        Parameters
-        ----------
-        imu_raw : np.ndarray  [N, 70]  (or [N, 50] if sensors 6-7 already absent)
-
-        Returns
-        -------
-        np.ndarray  [N, 30]  ordered as:
-            [s1_acc(3), s1_gyro(3), s2_acc(3), s2_gyro(3), ..., s5_acc(3), s5_gyro(3)]
-        """
-        return imu_raw[:, IMU_SENSOR_COLS].astype(np.float32)
-
-    @staticmethod
-    def _downsample_imu(imu_data: np.ndarray, target_length: int) -> np.ndarray:
-        """
-        Downsample IMU from 1000 Hz to 100 Hz by uniform index selection.
-
-        Uses np.linspace rather than a fixed stride so it is robust when the
-        recorded IMU length is not exactly 10x the VICON length (which can
-        happen at trial boundaries or if the collection was interrupted).
-
-        Parameters
-        ----------
-        imu_data      : np.ndarray  [N_imu, 30]
-        target_length : int         desired output rows (== VICON length)
-
-        Returns
-        -------
-        np.ndarray  [target_length, 30]
-        """
-        indices = np.linspace(0, imu_data.shape[0] - 1, target_length, dtype=int)
-        return imu_data[indices, :]
-
-    @staticmethod
-    def _zero_fill_missing_sensors(
-        imu_30: np.ndarray,
-        bad_cols: List[int],
-    ) -> np.ndarray:
-        """
-        Zero-fill channels that belong to non-reporting sensors.
-
-        Keeps the channel count fixed at 30 so the model architecture does not
-        change between subjects.  The gating agent can learn to ignore
-        these channels (constant-zero signal carries no information).
-
-        Parameters
-        ----------
-        imu_30   : np.ndarray  [N, 30]
-        bad_cols : list of column indices (into the 30-ch output) to zero-fill
-        """
-        out = imu_30.copy()
-        out[:, bad_cols] = 0.0
-        return out
-
-    # ------------------------------------------------------------------
-    # Core loading logic
-    # ------------------------------------------------------------------
-
-    def _process_mat_file(
-        self, mat_path: str, subject_id: int
-    ) -> List[Tuple[np.ndarray, int]]:
-        """
-        Load one .mat file and return a list of (window_array, label) pairs.
-
-        Each .mat file represents one perturbation type, repeated n_reps times
-        (typically >= 10).  Every window within the file gets the same label,
-        derived from the filename.
-
-        Parameters
-        ----------
-        mat_path   : full path to the .mat file
-        subject_id : integer subject ID (used for logging and sensor fix lookup)
-
-        Returns
-        -------
-        List of (np.ndarray [time_steps, 39], int)
-        """
-        mat_data    = scipy.io.loadmat(mat_path)
-        imu_cells   = mat_data['IMU_perturbation_data'][0]    # object array of cells
-        vicon_cells = mat_data['VICON_perturbation_data'][0]
-
-        label_str = self._extract_label_from_filename(os.path.basename(mat_path))
-        if label_str not in self.label_map:
-            logger.warning(
-                f"Subject {subject_id}: unknown label '{label_str}' in "
-                f"'{os.path.basename(mat_path)}', skipping file."
-            )
-            return []
-
-        label_id = self.label_map[label_str]
-        bad_cols  = SUBJECTS_WITH_MISSING_SENSORS.get(subject_id, [])
-        samples: List[Tuple[np.ndarray, int]] = []
-
-        for rep_idx in range(len(imu_cells)):
-            imu_raw   = np.array(imu_cells[rep_idx],  dtype=np.float64)  # [N_imu,  70]
-            vicon_raw = np.array(vicon_cells[rep_idx], dtype=np.float64)  # [N_vicon, 9]
-
-            # Replace any NaN values with 0 before processing
-            imu_raw   = np.where(np.isnan(imu_raw),  0.0, imu_raw)
-            vicon_raw = np.where(np.isnan(vicon_raw), 0.0, vicon_raw)
-
-            # --- Correct column selection (stride, not naive slice) ---
-            imu_30 = self._select_imu_channels(imu_raw)   # [N_imu, 30]
-
-            # --- Zero-fill known bad sensors (e.g. HAB-17 sensors 4 & 5) ---
-            if bad_cols:
-                imu_30 = self._zero_fill_missing_sensors(imu_30, bad_cols)
-
-            # Downsample IMU (1000 Hz) to match VICON rate (100 Hz)
-            target_len      = vicon_raw.shape[0]
-            imu_downsampled = self._downsample_imu(imu_30, target_len)  # [N_vicon, 30]
-
-            combined = np.concatenate(
-                [imu_downsampled, vicon_raw.astype(np.float32)], axis=1
-            ).astype(np.float32)  # [N_vicon, 39]
-
-            # Drop repetitions too short to yield even one window
-            if self.remove_short_perturbations and combined.shape[0] < self.min_length:
-                logger.debug(
-                    f"Subject {subject_id}: rep {rep_idx + 1} of '{label_str}' "
-                    f"too short ({combined.shape[0]} < {self.min_length}), skipping."
-                )
+        self._build_subject_index()
+    
+    def _load_data(self, subject_numbers):
+        """Load all perturbation data from subject folders."""
+        for subj in subject_numbers:
+            subj_folder = os.path.join(self.root, f"HAB-{subj}")
+            if not os.path.isdir(subj_folder):
+                print(f"Warning: Subject folder {subj_folder} not found")
                 continue
-
-            # Sliding window
-            for start in range(
-                0, combined.shape[0] - self.time_steps + 1, self.step
-            ):
-                window = combined[start: start + self.time_steps, :]  # [T, 39]
-                samples.append((window, label_id))
-
-        return samples
-
-    def _load_and_window(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Iterate over all subjects and .mat files, build the flat window arrays.
-
-        Returns
-        -------
-        X : np.ndarray  [N, T, C]
-        y : np.ndarray  [N]
-        """
-        all_X: List[np.ndarray] = []
-        all_y: List[int]        = []
-
-        for subject_id in self.subjects:
-            # Try zero-padded (HAB-01) and non-padded (HAB-1) folder names
-            subject_folder = os.path.join(self.data_root, f"HAB-{subject_id:02d}")
-            if not os.path.exists(subject_folder):
-                subject_folder = os.path.join(self.data_root, f"HAB-{subject_id}")
-            if not os.path.exists(subject_folder):
-                logger.warning(
-                    f"Subject {subject_id}: folder not found "
-                    f"(tried HAB-{subject_id:02d} and HAB-{subject_id}), skipping."
-                )
-                continue
-
-            mat_files = sorted(
-                f for f in os.listdir(subject_folder) if f.endswith('.mat')
-            )
-            if not mat_files:
-                logger.warning(
-                    f"Subject {subject_id}: no .mat files in {subject_folder}, skipping."
-                )
-                continue
-
-            if subject_id in SUBJECTS_WITH_MISSING_SENSORS:
-                bad = SUBJECTS_WITH_MISSING_SENSORS[subject_id]
-                log_info(
-                    f"Subject {subject_id}: output cols {bad} will be zero-filled "
-                    f"(known hardware fault on sensors 4 & 5)."
-                )
-
-            subject_samples: List[Tuple[np.ndarray, int]] = []
-
-            for mat_file in mat_files:
-                mat_path = os.path.join(subject_folder, mat_file)
-                try:
-                    file_samples = self._process_mat_file(mat_path, subject_id)
-                    subject_samples.extend(file_samples)
-                except Exception as e:
-                    logger.error(
-                        f"Subject {subject_id}: error processing '{mat_file}': {e}"
-                    )
+            
+            print(f"Loading subject {subj}...")
+            
+            for file in sorted(os.listdir(subj_folder)):
+                if not file.endswith(".mat"):
                     continue
-
-            self.subject_to_windows[subject_id] = subject_samples
-
-            for window, label in subject_samples:
-                all_X.append(window)
-                all_y.append(label)
-
-            log_info(
-                f"Subject {subject_id}: {len(subject_samples)} windows "
-                f"from {len(mat_files)} file(s)."
+                
+                filepath = os.path.join(subj_folder, file)
+                filename = os.path.splitext(file)[0]
+                
+                # Extract perturbation type from filename
+                perturbation_type = self._extract_perturbation_type(filename)
+                
+                # Load .mat file
+                mat = loadmat(filepath)
+                
+                # Check for required data
+                if 'IMU_perturbation_data' not in mat:
+                    print(f"  Warning: No IMU_perturbation_data in {file}")
+                    continue
+                
+                imu_perts = mat['IMU_perturbation_data'][0]
+                
+                # VICON data is optional
+                if self.use_kinematics and 'VICON_perturbation_data' not in mat:
+                    print(f"  Warning: No VICON_perturbation_data in {file}")
+                    vicon_perts = [None] * len(imu_perts)
+                elif self.use_kinematics:
+                    vicon_perts = mat['VICON_perturbation_data'][0]
+                else:
+                    vicon_perts = [None] * len(imu_perts)
+                
+                print(f"  File: {file} | Type: {perturbation_type} | "
+                      f"Perturbations: {len(imu_perts)}")
+                
+                # Process each perturbation
+                for pert_idx, (imu_pert, vicon_pert) in enumerate(zip(imu_perts, vicon_perts)):
+                    # Process IMU data
+                    if self.use_imu:
+                        imu_processed = self._process_imu_perturbation(imu_pert)
+                        self.X_imu.append(imu_processed)
+                    
+                    # Process VICON data
+                    if self.use_kinematics and vicon_pert is not None:
+                        kinematics_processed = self._process_kinematics_perturbation(vicon_pert)
+                        self.X_kinematics.append(kinematics_processed)
+                    
+                    self.Y.append(perturbation_type)
+                    self.subject_ids.append(subj)
+                    self.perturbation_ids.append(f"{filename}_pert{pert_idx+1}")
+    
+    def _extract_perturbation_type(self, filename):
+        """Extract perturbation type from filename, handling trial numbers."""
+        # Remove trial numbers (e.g., "T1", "T2") and any digits
+        base_name = re.sub(r'_?T\d+', '', filename)
+        base_name = re.sub(r'\d+', '', base_name).strip('_')
+        
+        # Check against known perturbation types
+        for pert_type in self.PERTURBATION_TYPES:
+            if pert_type in base_name:
+                return pert_type
+        
+        # Fallback: use cleaned filename
+        return base_name
+    
+    def _process_imu_perturbation(self, imu_data):
+        """
+        Process IMU perturbation data.
+        
+        Args:
+            imu_data: shape (T, 70) - raw IMU data
+        
+        Returns:
+            processed: shape (pert_window, num_imus*6)
+        """
+        # Select columns for first num_imus sensors (6 columns each: AccX,Y,Z + GyroX,Y,Z)
+        keep_idx = []
+        for i in range(self.num_imus):
+            base = i * 10
+            # Keep first 6 columns per sensor (skip orientation columns 6-9)
+            keep_idx.extend([base, base+1, base+2, base+3, base+4, base+5])
+        
+        data_selected = imu_data[:, keep_idx]  # shape: (T, num_imus*6)
+        
+        # Resample to fixed window length
+        if data_selected.shape[0] != self.pert_window:
+            data_selected = resample(data_selected, self.pert_window, axis=0)
+        
+        # Apply bandpass filter if requested
+        if self.apply_filter:
+            data_selected = self._butter_bandpass_filter(
+                data_selected, self.lowcut, self.highcut, self.fs
             )
-
-        if not all_X:
-            raise ValueError(
-                f"KinematicsDataset: no windows loaded for subjects {self.subjects}. "
-                f"Check data_root='{self.data_root}'."
-            )
-
-        X = np.array(all_X, dtype=np.float32)   # [N, T, C]
-        y = np.array(all_y, dtype=np.int64)      # [N]
-
-
-                # ========== ADD NORMALIZATION CODE HERE ==========
-        # Normalize per channel across all data
-        from sklearn.preprocessing import StandardScaler
         
-        N, T, C = X.shape
-        X_flat = X.reshape(-1, C)  # [N*T, C]
+        return data_selected
+    
+    def _process_kinematics_perturbation(self, vicon_data):
+        """
+        Process VICON kinematics perturbation data.
         
-        # Fit scaler on the current data (training or validation)
-        # Note: In production, you should fit only on training data and transform validation
-        self.scaler = StandardScaler()
-        X_flat_normalized = self.scaler.fit_transform(X_flat)
+        Args:
+            vicon_data: shape (T, 9) - COM + joint angles
         
-        # Reshape back to original dimensions
-        X = X_flat_normalized.reshape(N, T, C).astype(np.float32)
+        Returns:
+            processed: shape (pert_window, 9)
+        """
+        # VICON data already has the right shape, just resample
+        if vicon_data.shape[0] != self.pert_window:
+            vicon_data = resample(vicon_data, self.pert_window, axis=0)
         
-        # Store normalization stats for reference
-        self.channel_means = self.scaler.mean_
-        self.channel_stds = self.scaler.scale_
+        return vicon_data
+    
+    def _butter_bandpass_filter(self, data, lowcut, highcut, fs, order=4):
+        """Apply Butterworth bandpass filter."""
+        nyq = 0.5 * fs
+        low = lowcut / nyq
+        high = highcut / nyq
         
-        if self.is_main_process if hasattr(self, 'is_main_process') else True:
-            log_info(f"Data normalized: mean range [{self.channel_means.min():.2f}, {self.channel_means.max():.2f}], "
-                     f"std range [{self.channel_stds.min():.2f}, {self.channel_stds.max():.2f}]")
-        # ========== END NORMALIZATION CODE ==========
+        # Handle case where highcut >= Nyquist
+        if high >= 1.0:
+            high = 0.99
+        
+        b, a = butter(order, [low, high], btype='band')
+        filtered = filtfilt(b, a, data, axis=0)
+        return filtered
+    
+    def _compute_normalization_stats(self):
+        """Compute mean and std for z-score normalization."""
+        if self.use_imu and len(self.X_imu) > 0:
+            # Compute across all perturbations and time steps
+            all_imu = np.concatenate(self.X_imu, axis=0)  # (N*T, C)
+            self.imu_mean = np.mean(all_imu, axis=0, keepdims=True)
+            self.imu_std = np.std(all_imu, axis=0, keepdims=True)
+            self.imu_std[self.imu_std < 1e-6] = 1.0
+        
+        if self.use_kinematics and len(self.X_kinematics) > 0:
+            all_kinematics = np.concatenate(self.X_kinematics, axis=0)
+            self.kinematics_mean = np.mean(all_kinematics, axis=0, keepdims=True)
+            self.kinematics_std = np.std(all_kinematics, axis=0, keepdims=True)
+            self.kinematics_std[self.kinematics_std < 1e-6] = 1.0
+    
+    def _apply_normalization(self):
+        """Apply z-score normalization to all data."""
+        if self.use_imu and self.imu_mean is not None:
+            for i in range(len(self.X_imu)):
+                self.X_imu[i] = (self.X_imu[i] - self.imu_mean) / self.imu_std
+        
+        if self.use_kinematics and self.kinematics_mean is not None:
+            for i in range(len(self.X_kinematics)):
+                self.X_kinematics[i] = (self.X_kinematics[i] - self.kinematics_mean) / self.kinematics_std
+    
+    def get_combined_data(self, idx):
+        """Combine IMU and kinematics data for a given index."""
+        data_parts = []
+        
+        if self.use_imu:
+            data_parts.append(self.X_imu[idx])
+        
+        if self.use_kinematics:
+            data_parts.append(self.X_kinematics[idx])
+        
+        if len(data_parts) == 1:
+            return data_parts[0]
+        else:
+            return np.concatenate(data_parts, axis=1)  # (T, imu_channels + kinematics_channels)
+    
+    def __len__(self):
+        return len(self.Y)
+    
+    def __getitem__(self, idx):
+        x = self.get_combined_data(idx)
+        y = self.Y[idx]
+        
+        # Convert to torch tensors
+        # Shape: (T, C) -> (C, T) for Conv1D models
+        x_tensor = torch.tensor(x, dtype=torch.float32).permute(1, 0)
+        y_tensor = torch.tensor(y, dtype=torch.long)
+        
+        return x_tensor, y_tensor
+    
+    def get_metadata(self, idx):
+        """Return metadata for a given index."""
+        return {
+            'subject': self.subject_ids[idx],
+            'perturbation_id': self.perturbation_ids[idx],
+            'label': self.le.inverse_transform([self.Y[idx]])[0]
+        }
+    
+    def get_channel_info(self):
+        """Return information about the channels."""
+        channels = []
+        
+        if self.use_imu:
+            sensor_names = ['R_Thigh', 'R_Shank', 'L_Shank', 'L_Thigh', 'Torso']
+            signal_types = ['AccX', 'AccY', 'AccZ', 'GyroX', 'GyroY', 'GyroZ']
+            
+            for i in range(self.num_imus):
+                for sig in signal_types:
+                    channels.append(f"IMU_{sensor_names[i]}_{sig}")
+        
+        if self.use_kinematics:
+            kin_channels = [
+                'COM_X', 'COM_Y', 'COM_Z',
+                'L_Hip_Angle', 'L_Knee_Angle', 'L_Ankle_Angle',
+                'R_Hip_Angle', 'R_Knee_Angle', 'R_Ankle_Angle'
+            ]
+            channels.extend([f"VICON_{ch}" for ch in kin_channels])
+        
+        return channels
 
-        if self.balance:
-            X, y = self._balance_dataset(X, y)
+    def _build_subject_index(self):
+        """
+        Build subject_to_windows mapping for SequentialDataset compatibility.
+        This groups all perturbations by subject and maintains temporal order.
+        """
+        self.subject_to_windows = {}
+        
+        for idx in range(len(self.Y)):
+            subj = self.subject_ids[idx]
+            if subj not in self.subject_to_windows:
+                self.subject_to_windows[subj] = []
+            
+            # Get the data and label for this perturbation
+            x = self.get_combined_data(idx)  # (T, C)
+            x_tensor = torch.tensor(x, dtype=torch.float32).permute(1, 0)  # (C, T)
+            y = self.Y[idx]
+            
+            # Store with perturbation ID for ordering
+            pert_id = self.perturbation_ids[idx]
+            self.subject_to_windows[subj].append((x_tensor, y, pert_id))
+        
+        # Sort each subject's windows by perturbation ID (temporal order)
+        for subj in self.subject_to_windows:
+            self.subject_to_windows[subj].sort(key=lambda item: item[2])
+            # Remove pert_id after sorting
+            self.subject_to_windows[subj] = [(x, y) for x, y, _ in self.subject_to_windows[subj]]
+    
+    def get_subject_sequence(self, subject_id: str) -> List[Tuple[torch.Tensor, int]]:
+        """
+        Get the sequence of windows for a specific subject in temporal order.
+        
+        Args:
+            subject_id: Subject identifier (e.g., '15')
+            
+        Returns:
+            List of (x_tensor, y_label) tuples in temporal order
+        """
+        return self.subject_to_windows.get(subject_id, [])
+    
+    @property
+    def subjects(self) -> List[str]:
+        """Return list of unique subject IDs."""
+        return list(self.subject_to_windows.keys())    
 
-        unique_labels, counts = np.unique(y, return_counts=True)
-        log_info(f"Total windows : {len(X)}")
-        log_info(f"Feature shape : {X.shape}")
-        log_info(f"Label dist.   : {dict(zip(unique_labels.tolist(), counts.tolist()))}")
 
-        return X, y
-
-    # ------------------------------------------------------------------
-    # Balancing
-    # ------------------------------------------------------------------
-
-    def _balance_dataset(
-        self, X: np.ndarray, y: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Downsample the majority class to self.majority_n windows."""
-        unique_labels, counts = np.unique(y, return_counts=True)
-        log_info(
-            f"Label distribution before balancing: "
-            f"{dict(zip(unique_labels.tolist(), counts.tolist()))}"
-        )
-
-        majority_class = unique_labels[np.argmax(counts)]
-        maj_mask = y == majority_class
-        min_mask = ~maj_mask
-
-        X_maj, y_maj = X[maj_mask], y[maj_mask]
-        X_min, y_min = X[min_mask], y[min_mask]
-
-        if len(X_maj) > self.majority_n:
-            np.random.seed(42)
-            idx   = np.random.choice(len(X_maj), self.majority_n, replace=False)
-            X_maj = X_maj[idx]
-            y_maj = y_maj[idx]
-
-        X_out = np.concatenate([X_maj, X_min], axis=0)
-        y_out = np.concatenate([y_maj, y_min], axis=0)
-
-        shuf  = np.random.permutation(len(X_out))
-        X_out = X_out[shuf]
-        y_out = y_out[shuf]
-
-        # Subject sequences are now meaningless after global shuffle
-        self.subject_to_windows = {sid: [] for sid in self.subjects}
-        log_info("Balancing applied; subject_to_windows invalidated.")
-
-        return X_out, y_out
-
-    # ------------------------------------------------------------------
-    # Dataset protocol
-    # ------------------------------------------------------------------
-
-    def __len__(self) -> int:
-        return len(self.y)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return (x [C, T], y) - channels-first, matching mHEALTH convention."""
-        x = torch.from_numpy(self.X[idx])  # [T, C]
-        x = x.transpose(0, 1)             # [C, T]
-        y = torch.tensor(self.y[idx], dtype=torch.long)
+class IMUFeatureDataset(Dataset):
+    """
+    Feature-based dataset that extracts statistical features from both
+    IMU and VICON data (mean, std, AUC, peak).
+    
+    This replicates the feature extraction approach from network_training.m
+    """
+    
+    def __init__(self, root="Data", subject_numbers=None, num_imus=5, 
+                 label_encoder=None, use_imu=True, use_kinematics=True):
+        self.root = root
+        self.num_imus = num_imus
+        self.use_imu = use_imu
+        self.use_kinematics = use_kinematics
+        
+        self.X = []
+        self.Y = []
+        
+        if subject_numbers is None:
+            subject_numbers = []
+        
+        self._load_and_extract_features(subject_numbers)
+        
+        self.X = np.array(self.X, dtype=np.float32)
+        
+        if label_encoder is None:
+            self.le = LabelEncoder()
+            self.Y = self.le.fit_transform(self.Y)
+        else:
+            self.le = label_encoder
+            self.Y = self.le.transform(self.Y)
+        
+        self.Y = np.array(self.Y, dtype=np.int64)
+    
+    def _load_and_extract_features(self, subject_numbers):
+        """Load data and extract statistical features."""
+        for subj in subject_numbers:
+            subj_folder = os.path.join(self.root, f"HAB-{subj}")
+            if not os.path.isdir(subj_folder):
+                continue
+            
+            for file in os.listdir(subj_folder):
+                if not file.endswith(".mat"):
+                    continue
+                
+                filename = os.path.splitext(file)[0]
+                perturbation_type = re.sub(r"[_T]?\d+", "", filename).strip('_')
+                
+                mat = loadmat(os.path.join(subj_folder, file))
+                
+                if 'IMU_perturbation_data' not in mat:
+                    continue
+                
+                imu_perts = mat['IMU_perturbation_data'][0]
+                vicon_perts = mat.get('VICON_perturbation_data', [None] * len(imu_perts))[0]
+                
+                for imu_pert, vicon_pert in zip(imu_perts, vicon_perts):
+                    feats = []
+                    
+                    if self.use_imu:
+                        imu_feats = self._extract_imu_features(imu_pert)
+                        feats.extend(imu_feats)
+                    
+                    if self.use_kinematics and vicon_pert is not None:
+                        kin_feats = self._extract_kinematics_features(vicon_pert)
+                        feats.extend(kin_feats)
+                    
+                    if feats:  # Only add if we have features
+                        self.X.append(feats)
+                        self.Y.append(perturbation_type)
+    
+    def _extract_features_from_signal(self, sig):
+        """Extract mean, std, AUC, and peak from a signal."""
+        return [
+            np.mean(sig),
+            np.std(sig),
+            np.trapz(np.abs(sig)),
+            np.max(np.abs(sig))
+        ]
+    
+    def _extract_imu_features(self, imu_data):
+        """Extract features from IMU data."""
+        feats = []
+        for i in range(self.num_imus):
+            base = i * 10
+            # AccX, AccY, AccZ
+            for j in range(3):
+                feats.extend(self._extract_features_from_signal(imu_data[:, base + j]))
+            # GyroX, GyroY, GyroZ
+            for j in range(3, 6):
+                feats.extend(self._extract_features_from_signal(imu_data[:, base + j]))
+        return feats
+    
+    def _extract_kinematics_features(self, vicon_data):
+        """Extract features from VICON kinematics data."""
+        feats = []
+        for j in range(vicon_data.shape[1]):
+            feats.extend(self._extract_features_from_signal(vicon_data[:, j]))
+        return feats
+    
+    def __len__(self):
+        return len(self.X)
+    
+    def __getitem__(self, idx):
+        x = torch.tensor(self.X[idx], dtype=torch.float32)
+        y = torch.tensor(self.Y[idx], dtype=torch.long)
         return x, y
 
-    def get_subject_sequence(
-        self, subject_id: int
-    ) -> List[Tuple[torch.Tensor, int]]:
-        """
-        Return all windows for one subject in temporal order.
 
-        Used by SequentialDataset and the BPTT loop in agent_trainer.py.
-        Raises RuntimeError if balance=True was used (order is destroyed).
-        """
-        if self.balance:
-            raise RuntimeError(
-                "get_subject_sequence is not supported when balance=True "
-                "because global shuffling destroys temporal ordering."
-            )
-        if subject_id not in self.subject_to_windows:
-            log_info(f"Subject {subject_id} has no data in this dataset split.")
-            return []
-
-        sequence = []
-        for x_np, lbl in self.subject_to_windows[subject_id]:
-            x = torch.from_numpy(x_np).float()  # [T, C]
-            x = x.transpose(0, 1)               # [C, T]
-            sequence.append((x, int(lbl)))
-        return sequence
-
-
-# ---------------------------------------------------------------------------
-# Convenience dataloader factory
-# ---------------------------------------------------------------------------
-
-def get_kinematics_dataloaders(
-    data_root: str,
-    batch_size: int = 64,
-    time_steps: int = 100,
-    step: int = 50,
-    balance: bool = False,
-    train_subjects: Optional[List[int]] = None,
-    val_subjects:   Optional[List[int]] = None,
-) -> Tuple[DataLoader, DataLoader]:
-    """
-    Build train and validation DataLoaders for the kinematics dataset.
-
-    Args:
-        data_root:       Path to the Data_with_Kinematics root directory.
-        batch_size:      DataLoader batch size.
-        time_steps:      Sliding window length (samples at 100 Hz).
-        step:            Sliding window stride.
-        balance:         Downsample majority class in the training set.
-        train_subjects:  Subject IDs for training   (default: HAB-15 to HAB-22).
-        val_subjects:    Subject IDs for validation (default: HAB-23, HAB-24).
-
-    Returns:
-        train_loader, val_loader
-    """
-    from dataset.sequential_dataset import SequentialDataset, collate_sequential_batch
-
-    if train_subjects is None:
-        train_subjects = list(range(15, 23))   # HAB-15 to HAB-22
-    if val_subjects is None:
-        val_subjects = [23, 24]                # HAB-23, HAB-24
-
-    train_base = KinematicsDataset(
-        data_root=data_root,
-        subjects=train_subjects,
-        time_steps=time_steps,
-        step=step,
-        balance=balance,
-    )
-    val_base = KinematicsDataset(
-        data_root=data_root,
-        subjects=val_subjects,
-        time_steps=time_steps,
-        step=step,
-        balance=False,   # never balance the validation set
-    )
-
-    train_dataset = SequentialDataset(train_base, subject_ids=train_subjects)
-    val_dataset   = SequentialDataset(val_base,   subject_ids=val_subjects)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_sequential_batch,
-        num_workers=4,
-        pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_sequential_batch,
-        num_workers=4,
-        pin_memory=True,
-    )
-
-    return train_loader, val_loader
-
-
-# ---------------------------------------------------------------------------
-# Smoke test   python kinematics_loader.py /path/to/Data_with_Kinematics
-# ---------------------------------------------------------------------------
-
+# -----------------------
+# Usage Example
+# -----------------------
 if __name__ == "__main__":
-    import sys
-
-    data_root = (
-        sys.argv[1] if len(sys.argv) > 1
-        else "/home/bkl46/CSE_MSE_RXF131/cradle-members/mds3/bkl46/"
-             "multimodal-medical-agent/data/Data_with_Kinematics"
-    )
-
+    # Test the dataset loader
+    train_subjects = ['15', '16', '17', '18', '19', '20', '21']
+    test_subjects = ['22', '23']
+    
     print("=" * 60)
-    print("KinematicsDataset smoke test")
+    print("Testing IMU + Kinematics Dataset Loader")
     print("=" * 60)
-
-    # ---- Basic single-subject test ----
-    print("\n[1] Single subject (HAB-15) ...")
-    ds = KinematicsDataset(
-        data_root=data_root,
-        subjects=[15],
-        time_steps=100,
-        step=50,
-        balance=False,
+    
+    # Create dataset with both IMU and kinematics
+    print("\n1. Loading dataset with IMU + VICON kinematics...")
+    train_set = IMUKinematicsDataset(
+        root="../IMU_Data",
+        subject_numbers=train_subjects,
+        pert_window=2000,
+        use_imu=True,
+        use_kinematics=True,
+        normalize=True,
+        apply_filter=True
     )
-    print(f"    Dataset size : {len(ds)}")
-    if len(ds) > 0:
-        x, y = ds[0]
-        print(f"    x shape      : {x.shape}  (expected [39, 100])")
-        print(f"    y            : {y.item()} = '{ds.inverse_label_map[y.item()]}'")
-        print(f"    x[0] range   : [{x[0].min():.4f}, {x[0].max():.4f}]")
-    print(f"    Label map    : {ds.label_map}")
-
-    # ---- Verify column selection correctness ----
-    print("\n[2] Verifying IMU column selection ...")
-    print(f"    Selected raw cols : {IMU_SENSOR_COLS}")
-    print(f"    Num IMU channels  : {NUM_IMU_CHANNELS}  (expected 30)")
-    print(f"    Total channels    : {NUM_ALL_CHANNELS}  (expected 39)")
-
-    # ---- Subject sequence (BPTT compatibility) ----
-    print("\n[3] Subject sequence for BPTT ...")
-    seq = ds.get_subject_sequence(15)
-    print(f"    Sequence length : {len(seq)} windows")
-    if seq:
-        sx, sy = seq[0]
-        print(f"    First window    : x={sx.shape}, y={sy}")
-
-    # ---- HAB-17 zero-fill test ----
-    print("\n[4] HAB-17 (missing sensors 4 & 5) ...")
-    try:
-        ds17 = KinematicsDataset(
-            data_root=data_root,
-            subjects=[17],
-            time_steps=100,
-            step=50,
-        )
-        print(f"    Dataset size : {len(ds17)}")
-        if len(ds17) > 0:
-            x17, _ = ds17[0]
-            # Output channels 18-29 should be exactly 0 after zero-fill
-            bad_ch_max = x17[18:30].abs().max().item()
-            status = "OK (all zero)" if bad_ch_max == 0.0 else f"WARNING max={bad_ch_max:.4f}"
-            print(f"    Sensor 4-5 output cols (18-29): {status}")
-    except Exception as e:
-        print(f"    HAB-17 not available or error: {e}")
+    
+    print(f"   Dataset size: {len(train_set)} perturbations")
+    print(f"   Number of classes: {len(train_set.le.classes_)}")
+    print(f"   Classes: {train_set.le.classes_}")
+    print(f"   Total channels: {train_set.num_channels}")
+    print(f"   Channel info: {train_set.get_channel_info()[:5]}...")
+    
+    # Test data loader
+    train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
+    
+    for xb, yb in train_loader:
+        print(f"\n   Batch X shape: {xb.shape}")  # Expected: (B, C, T)
+        print(f"   Batch Y shape: {yb.shape}")
+        print(f"   First 10 labels: {yb[:10]}")
+        
+        # Check metadata
+        print(f"\n   Sample metadata:")
+        for i in range(min(3, len(train_set))):
+            meta = train_set.get_metadata(i)
+            print(f"     {i}: {meta}")
+        break
+    
+    # Test feature-based dataset
+    print("\n" + "=" * 60)
+    print("Testing Feature-based Dataset Loader")
+    print("=" * 60)
+    
+    feature_set = IMUFeatureDataset(
+        root="../IMU_Data",
+        subject_numbers=train_subjects[:2],  # Use fewer subjects for quick test
+        use_imu=True,
+        use_kinematics=True
+    )
+    
+    print(f"   Dataset size: {len(feature_set)} perturbations")
+    print(f"   Feature dimension: {feature_set.X.shape[1]}")
+    
+    feature_loader = DataLoader(feature_set, batch_size=32, shuffle=True)
+    
+    for xb, yb in feature_loader:
+        print(f"\n   Batch X shape: {xb.shape}")  # Expected: (B, F)
+        print(f"   Batch Y shape: {yb.shape}")
+        break

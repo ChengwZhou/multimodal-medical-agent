@@ -385,6 +385,71 @@ def main():
             collate_fn=simple_collate,
             drop_last=False
         )
+    elif args.dataset == 'imu_kinematics':
+        train_subjects = ['15','16','17','18','20']
+        test_subjects = ['22','23']
+        
+        train_dataset = IMUKinematicsDataset(
+            root=args.data_root, 
+            subject_numbers=train_subjects, 
+            pert_window=8000,
+            use_imu=True,
+            use_kinematics=True,
+            normalize=True
+        )
+        
+        val_dataset = IMUKinematicsDataset(
+            root=args.data_root, 
+            subject_numbers=test_subjects, 
+            pert_window=8000, 
+            label_encoder=train_dataset.le,
+            use_imu=True,
+            use_kinematics=True,
+            normalize=True
+        )
+
+
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True
+        ) if world_size > 1 else None
+
+        val_sampler = DistributedSampler(
+            val_dataset, num_replicas=world_size, rank=rank, shuffle=False
+        ) if world_size > 1 else None
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            shuffle=(train_sampler is None),
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=lambda batch: (
+                torch.stack([x for x, _ in batch], dim=0),
+                torch.tensor([y for _, y in batch], dtype=torch.long)
+            ),
+            drop_last=False
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            sampler=val_sampler,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=lambda batch: (
+                torch.stack([x for x, _ in batch], dim=0),
+                torch.tensor([y for _, y in batch], dtype=torch.long)
+            ),
+            drop_last=False
+        )
+
+
+
+        
+        num_classes = len(train_dataset.le.classes_)
+        num_modal = train_dataset.num_channels
 
     elif args.dataset == 'imu':
         train_subjects = ['15','16','17','18','20']
