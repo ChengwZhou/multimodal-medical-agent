@@ -14,9 +14,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import get_rank, is_initialized
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR, SequentialLR
 import torch.distributed as dist
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 
 import numpy as np
 from typing import List, Tuple, Dict, Optional, Any
@@ -48,7 +49,12 @@ from dataset.sequential_dataset import (
 from dataset.ScientISST_MOVE_loader import ScientISSTMOVEDataset, filter_labels
 from dataset.mHEALTH_loader import MHealthDataset
 from dataset.hmc_loader import HMCSleepDataset
-from dataset.WESAD_loader import WESADDataset
+from dataset.seizeit2_loader import (SeizeIT2Dataset, SeizeIT2IterableDataset,
+                                     SeizeIT2PreextractedDataset,
+                                     SeizeIT2PreextractedIterableDataset,
+                                     preextract_to_dir)
+from dataset.emowear_loader import EmoWearDataset, emowear_modality_configs
+# from dataset.WESAD_loader import MultiModalWESADDataset
 from utils.metrics import compute_metrics, print_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -65,8 +71,13 @@ class AgentSequentialTrainer:
             self,
             model: nn.Module,
             agent: SensorGatingAgent,
-            train_dataset: SequentialDataset,
+            train_dataset: Optional[SequentialDataset] = None,
             val_dataset: Optional[SequentialDataset] = None,
+            # Pre-built loaders for large datasets that bypass SequentialDataset
+            # (e.g. SeizeIT2 with ~41 M windows).  When supplied, train_dataset /
+            # val_dataset are ignored and each batch is treated as a length-1 sequence.
+            train_loader: Optional[DataLoader] = None,
+            val_loader: Optional[DataLoader] = None,
             only_predictive: bool = False,
             batch_size: int = 8,
             learning_rate: float = 1e-3,
@@ -96,8 +107,7 @@ class AgentSequentialTrainer:
             # DDP settings
             ddp_rank: Optional[int] = None,
             ddp_world_size: Optional[int] = None,
-            ddp_port: str = "12355",
-            cls_weights=None,
+            ddp_port: str = "12355"
     ):
         self.model = model
         self.agent = agent
@@ -168,46 +178,52 @@ class AgentSequentialTrainer:
         self.scaler = GradScaler(enabled=self.use_amp)
 
         # Setup data loaders
-        if self.is_ddp:
-            from torch.utils.data.distributed import DistributedSampler
-            train_sampler = DistributedSampler(train_dataset, rank=self.rank, shuffle=True)
-            val_sampler = DistributedSampler(val_dataset, rank=self.rank, shuffle=False) if val_dataset else None
+        if train_loader is not None:
+            # --- Plain-loader path (large datasets, e.g. SeizeIT2) ---
+            # Each batch is a plain (x [B,C,T], y [B]) tuple.
+            # train_step_bptt / validate will wrap it into a length-1 SequentialBatch.
+            self.train_loader = train_loader
+            self.val_loader   = val_loader   # may be None
+            self.max_len      = 1
         else:
-            train_sampler = None
-            val_sampler = None
+            # --- SequentialDataset path (default) ---
+            if self.is_ddp:
+                from torch.utils.data.distributed import DistributedSampler
+                train_sampler = DistributedSampler(train_dataset, rank=self.rank, shuffle=True)
+                val_sampler = DistributedSampler(val_dataset, rank=self.rank, shuffle=False) if val_dataset else None
+            else:
+                train_sampler = None
+                val_sampler = None
 
-        max_len = train_dataset.max_length
-        if self.is_ddp:
-            max_tensor = torch.tensor([max_len], device=self.device)
-            dist.all_reduce(max_tensor, op=dist.ReduceOp.MIN)
-            max_len = max_tensor.item()
-        self.max_len = max_len
-        # print(self.max_len)
+            max_len = train_dataset.max_length
+            if self.is_ddp:
+                max_tensor = torch.tensor([max_len], device=self.device)
+                dist.all_reduce(max_tensor, op=dist.ReduceOp.MIN)
+                max_len = max_tensor.item()
+            self.max_len = max_len
 
-        self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=(train_sampler is None),
-            sampler=train_sampler,
-            # collate_fn=lambda batch: collate_sequential_batch_sync(batch, max_len),  #
-            collate_fn=collate_sequential_batch,
-            num_workers=4,
-            pin_memory=False,
-            persistent_workers=True,
-        )
-
-        if val_dataset:
-            self.val_loader = DataLoader(
-                val_dataset,
+            self.train_loader = DataLoader(
+                train_dataset,
                 batch_size=batch_size,
-                shuffle=False,
-                sampler=val_sampler,
-                # collate_fn=lambda batch: collate_sequential_batch_sync(batch, max_len),
+                shuffle=(train_sampler is None),
+                sampler=train_sampler,
                 collate_fn=collate_sequential_batch,
                 num_workers=4,
                 pin_memory=False,
-                persistent_workers=True
+                persistent_workers=True,
             )
+
+            if val_dataset:
+                self.val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    sampler=val_sampler,
+                    collate_fn=collate_sequential_batch,
+                    num_workers=4,
+                    pin_memory=False,
+                    persistent_workers=True
+                )
 
         # Create save directory
         if self.is_main_process:
@@ -255,35 +271,35 @@ class AgentSequentialTrainer:
             log_info(
                 f"Predictive loss: {use_predictive_loss}, weight: {predictive_weight}, offset: {predictive_offset}")
 
-    def get_lr_schedulers(self, total_steps: int):
-        """Get learning rate schedulers with warmup for model, agent, and predictive MLP"""
-        model_scheduler = OneCycleLR(
-            self.model_optimizer,
-            max_lr=self.model_optimizer.param_groups[0]['lr'],
-            total_steps=total_steps,
-            pct_start=self.warmup_steps / total_steps,
-            anneal_strategy='cos'
-        )
+    def get_lr_schedulers(self, steps_per_epoch: int):
+        """Get learning rate schedulers — no total_steps required.
 
-        agent_scheduler = OneCycleLR(
-            self.agent_optimizer,
-            max_lr=self.agent_optimizer.param_groups[0]['lr'],
-            total_steps=total_steps,
-            pct_start=self.warmup_steps / total_steps,
-            anneal_strategy='cos'
-        )
-
-        schedulers = {"model": model_scheduler, "agent": agent_scheduler}
-        if self.use_predictive_loss:
-            predictive_scheduler = OneCycleLR(
-                self.predictive_optimizer,
-                max_lr=self.predictive_optimizer.param_groups[0]['lr'],
-                total_steps=total_steps,
-                pct_start=self.warmup_steps / total_steps,
-                anneal_strategy='cos'
+        Uses CosineAnnealingWarmRestarts: LR decays cosine-style within each
+        epoch and restarts at the beginning of the next.  ``T_0`` = one epoch
+        in batches so the cycle aligns with epoch boundaries.
+        A short linear warmup is applied via a LambdaLR multiplicative factor
+        for the first ``warmup_steps`` batches.
+        """
+        def _make(optimizer):
+            warmup = LambdaLR(
+                optimizer,
+                lr_lambda=lambda s: min(1.0, (s + 1) / max(self.warmup_steps, 1))
             )
-            schedulers["predictive"] = predictive_scheduler
+            cosine = CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=max(steps_per_epoch, 1),
+                T_mult=1,
+                eta_min=optimizer.param_groups[0]['lr'] * 0.01,
+            )
+            return SequentialLR(optimizer, schedulers=[warmup, cosine],
+                                milestones=[self.warmup_steps])
 
+        schedulers = {
+            "model": _make(self.model_optimizer),
+            "agent": _make(self.agent_optimizer),
+        }
+        if self.use_predictive_loss:
+            schedulers["predictive"] = _make(self.predictive_optimizer)
         return schedulers
 
     def compute_contrastive_loss(self, embeddings: torch.Tensor, labels: torch.Tensor,
@@ -351,10 +367,42 @@ class AgentSequentialTrainer:
         loss = F.mse_loss(pred_embeddings, embeddings_t_plus_delta, reduction='mean')
         return loss
 
-    def train_step_bptt(self, batch: SequentialBatch) -> Dict[str, float]:
+    @staticmethod
+    def _wrap_plain_batch(batch) -> SequentialBatch:
+        """Wrap a plain batch as a SequentialBatch.
+
+        Handles two shapes from ``SeizeIT2IterableDataset``:
+        * ``x [B, C, T]``         — single window per item  → seq_len = 1
+        * ``x [B, bptt, C, T]``   — BPTT sequence per item → seq_len = bptt
         """
-        Training step with BPTT over multiple windows, including contrastive and predictive losses
+        x, y = batch
+        if x.dim() == 3:
+            # Single-window batch: [B, C, T] → [B, 1, C, T]
+            return SequentialBatch(
+                sequences   = x.unsqueeze(1),
+                labels      = y.unsqueeze(1),
+                seq_lengths = torch.ones(x.shape[0], dtype=torch.long),
+                subject_ids = [str(i) for i in range(x.shape[0])],
+            )
+        else:
+            # BPTT batch: x is [B, bptt_steps, C, T], y is [B, bptt_steps]
+            B, T_seq = x.shape[0], x.shape[1]
+            return SequentialBatch(
+                sequences   = x,                                           # [B, bptt, C, T]
+                labels      = y,                                           # [B, bptt]
+                seq_lengths = torch.full((B,), T_seq, dtype=torch.long),
+                subject_ids = [str(i) for i in range(B)],
+            )
+
+    def train_step_bptt(self, batch) -> Dict[str, float]:
         """
+        Training step with BPTT over multiple windows, including contrastive and predictive losses.
+        Accepts either a :class:`SequentialBatch` (default) or a plain ``(x, y)`` tuple
+        (ImageFolder-style datasets such as SeizeIT2).
+        """
+        if not isinstance(batch, SequentialBatch):
+            batch = self._wrap_plain_batch(batch)
+
         self.model.train()
         self.agent.train()
         if self.use_predictive_loss:
@@ -366,6 +414,7 @@ class AgentSequentialTrainer:
         seq_lengths = batch.seq_lengths.to(self.device)  # [B]
 
         B, max_seq_len, C, T = sequences.shape
+        print("sequences.shape:", sequences.shape)
 
         # print(max_seq_len, self.device)
         M = self.agent.module.num_modalities if self.is_ddp else self.agent.num_modalities
@@ -433,7 +482,7 @@ class AgentSequentialTrainer:
                 # If we have memory from previous window, use agent to get gating
                 if mem is not None and i > start_idx:
                     # Agent decides which sensors to use based on previous memory
-                    with autocast(enabled=self.use_amp):
+                    with autocast('cuda', enabled=self.use_amp):
                         agent_output = self.agent(
                             represent_features=mem,  # Use memory as representation
                             sensor_history=sensor_history,
@@ -470,7 +519,7 @@ class AgentSequentialTrainer:
                     p_soft = None
 
                 # Forward through model
-                with autocast(enabled=self.use_amp):
+                with autocast('cuda', enabled=self.use_amp):
                     logits, mem = self.model(window_masked, mem_running_context if i > start_idx else None)
 
                     # Store memory for context input (detached)
@@ -619,7 +668,7 @@ class AgentSequentialTrainer:
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
         """Validation loop with agent gating - support single GPU & DDP"""
-        if not self.val_dataset:
+        if not self.val_dataset and not self.val_loader:
             return {}
 
         self.model.eval()
@@ -641,6 +690,8 @@ class AgentSequentialTrainer:
         use_distributed_sampler = self.is_ddp and hasattr(self.val_loader.sampler, 'set_epoch')
 
         for batch in tqdm(self.val_loader, desc="Validation", leave=False, disable=not self.is_main_process):
+            if not isinstance(batch, SequentialBatch):
+                batch = self._wrap_plain_batch(batch)
             sequences = batch.sequences.to(self.device)
             labels = batch.labels.to(self.device)
             B, max_seq_len, C, T = sequences.shape
@@ -666,7 +717,7 @@ class AgentSequentialTrainer:
 
                 # Agent gating
                 if mem is not None:
-                    with autocast(enabled=self.use_amp):
+                    with autocast('cuda', enabled=self.use_amp):
                         agent_output = self.agent(
                             represent_features=mem,
                             sensor_history=sensor_history,
@@ -695,7 +746,7 @@ class AgentSequentialTrainer:
                     window_masked = window
 
                 # Model forward
-                with autocast(enabled=self.use_amp):
+                with autocast('cuda', enabled=self.use_amp):
                     logits, mem = self.model(window_masked, mem_running_context)
 
                     if mem_running_context is None:
@@ -792,20 +843,26 @@ class AgentSequentialTrainer:
         if self.is_main_process:
             log_info(f"Starting training for {num_epochs} epochs with BPTT (steps={self.bptt_steps})")
 
-        # Calculate total steps for lr scheduler
-        max_seq_len = int(max(next(iter(self.train_loader)).seq_lengths))
-        steps_per_epoch = len(self.train_loader) * max_seq_len // self.bptt_steps
-        total_steps = int(steps_per_epoch * num_epochs * 1.05)
-        self.schedulers = self.get_lr_schedulers(total_steps)
+        # Calculate total steps for lr scheduler.
+        # For IterableDataset (e.g. SeizeIT2IterableDataset) we must NOT call
+        # next(iter(loader)) here because:
+        #   1. It triggers __iter__ which reads a full EDF recording (~30s on NFS)
+        #   2. The iterator is then discarded, so the epoch loop reads it AGAIN
+        # Instead, detect the batch type cheaply from dataset metadata.
+        steps_per_epoch = len(self.train_loader)
+        self.schedulers = self.get_lr_schedulers(steps_per_epoch)
 
         for epoch in range(num_epochs):
             log_info("="*70)
             log_info(f"Current Epoch: {epoch}")
             self.epoch = epoch
 
-            # Set sampler epoch for DDP
+            # Set sampler epoch for DDP (DistributedSampler)
             if hasattr(self.train_loader.sampler, 'set_epoch'):
                 self.train_loader.sampler.set_epoch(epoch)
+            # Set epoch for SeizeIT2IterableDataset (controls per-epoch shuffle seed)
+            if hasattr(self.train_loader.dataset, 'set_epoch'):
+                self.train_loader.dataset.set_epoch(epoch)
 
             epoch_losses = []
             epoch_accuracies = []
@@ -825,7 +882,7 @@ class AgentSequentialTrainer:
                     epoch_predictive_losses.append(metrics["predictive_loss"])
 
                     if self.is_main_process and batch_idx % self.log_interval == 0:
-                        log_msg = f"Step {batch_idx}: loss={metrics['loss']:.4f}, " \
+                        log_msg = f"[{batch_idx}/{len(self.train_loader)}] loss={metrics['loss']:.4f}, " \
                                   f"ce_loss={metrics['ce_loss']:.4f}, " \
                                   f"gating_loss={metrics['gating_loss']:.4f}, " \
                                   f"contrastive_loss={metrics['contrastive_loss']:.4f}, " \
@@ -851,7 +908,7 @@ class AgentSequentialTrainer:
                          f"sensor_usage={epoch_sensors:.3f}, contrastive_loss={epoch_contrastive:.4f}, "
                          f"predictive_loss={epoch_predictive:.4f}, time={epoch_time:.1f}s")
 
-            if self.step % self.val_interval == 0 and self.val_dataset:
+            if epoch % self.val_interval == 0 and (self.val_dataset or self.val_loader):
                 val_metrics = self.validate()
                 if self.is_main_process:
                     log_info(f"Epoch {epoch} Validation: {val_metrics}")
@@ -937,33 +994,48 @@ class AgentSequentialTrainer:
 
 
 def create_agent_trainer_from_dataset(
-        dataset,
-        train_subject_ids: List[str],
+        dataset=None,
+        train_subject_ids: Optional[List[str]] = None,
         val_subject_ids: Optional[List[str]] = None,
         model: Optional[nn.Module] = None,
         agent: Optional[SensorGatingAgent] = None,
         trainer_config: Optional[Dict] = None,
-        ddp_config: Optional[Dict] = None
+        ddp_config: Optional[Dict] = None,
+        # Pre-built loaders for large plain-batch datasets (bypass SequentialDataset)
+        train_loader: Optional[DataLoader] = None,
+        val_loader: Optional[DataLoader] = None,
 ) -> AgentSequentialTrainer:
     """
-    Convenience function to create agent trainer from ScientISSTMOVEDataset
-    """
-    train_sequential = SequentialDataset(dataset, train_subject_ids)
-    val_sequential = None
-    if val_subject_ids:
-        val_sequential = SequentialDataset(dataset, val_subject_ids)
+    Convenience function to create AgentSequentialTrainer.
 
+    Pass ``train_loader`` / ``val_loader`` to bypass SequentialDataset for
+    large datasets (e.g. SeizeIT2) that use ImageFolder-style plain batches.
+    """
     trainer_config = trainer_config or {}
     ddp_config = ddp_config or {}
     trainer_config.update(ddp_config)
 
-    trainer = AgentSequentialTrainer(
-        model=model,
-        agent=agent,
-        train_dataset=train_sequential,
-        val_dataset=val_sequential,
-        **trainer_config
-    )
+    if train_loader is not None:
+        trainer = AgentSequentialTrainer(
+            model=model,
+            agent=agent,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            **trainer_config
+        )
+    else:
+        train_sequential = SequentialDataset(dataset, train_subject_ids)
+        val_sequential = None
+        if val_subject_ids:
+            val_sequential = SequentialDataset(dataset, val_subject_ids)
+
+        trainer = AgentSequentialTrainer(
+            model=model,
+            agent=agent,
+            train_dataset=train_sequential,
+            val_dataset=val_sequential,
+            **trainer_config
+        )
 
     return trainer
 
@@ -973,10 +1045,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=str, default="12355")
-    parser.add_argument('--dataset', type=str, default='siscientisst')
+    parser.add_argument('--dataset', type=str, default='siscientisst',
+                        choices=['siscientisst', 'mhealth', 'hmc', 'seizeit2', 'emowear'])
+    parser.add_argument('--emowear_label', type=str, default='valence',
+                        choices=['valence', 'arousal', 'quadrant'],
+                        help='EmoWear label mode: valence/arousal (binary) or quadrant (4-class)')
     parser.add_argument('--root', type=str,
                         default='/Users/chengweizhou/PycharmProjects/data/scientisst-move-annotated-wearable-multimodal-biosignals-recorded-during-everyday-life-activities-in-naturalistic-environments-1.0.1')
-    parser.add_argument('--save_dir', type=str, default='./checkpoints')
     parser.add_argument('--model_lr', type=float, default=3e-4)
     parser.add_argument('--agent_lr', type=float, default=3e-4)
     parser.add_argument('--batch_size', type=int, default=12)
@@ -1005,6 +1080,19 @@ if __name__ == "__main__":
     parser.add_argument('--use_predictive_loss', action='store_true')
     parser.add_argument('--predictive_weight', type=float, default=0.1)
     parser.add_argument('--predictive_offset', type=int, default=1)
+    parser.add_argument('--cache_dir', type=str, default=None,
+                        help='Local directory to cache SeizeIT2 window index (avoids '
+                             'repeated NFS header scans; recommended: /scratch/$USER/seizeit2_cache)')
+    parser.add_argument('--num_data_workers', type=int, default=0,
+                        help='DataLoader num_workers for SeizeIT2. Keep 0 on NFS mounts '
+                             '(workers enter D-state and hang); set to 2-4 when data is on local SSD.')
+    parser.add_argument('--preextracted_dir', type=str, default=None,
+                        help='Path to pre-extracted numpy windows directory produced by '
+                             '--preprocess_seizeit2. When set, uses SeizeIT2PreextractedDataset '
+                             'for fast random access (batch_size=512, no EDF parsing).')
+    parser.add_argument('--preprocess_seizeit2', action='store_true',
+                        help='Extract all SeizeIT2 windows to --preextracted_dir and exit. '
+                             'Run once offline before training. Requires --root and --preextracted_dir.')
 
     args = parser.parse_args()
 
@@ -1013,7 +1101,17 @@ if __name__ == "__main__":
     is_distributed = world_size > 1
 
     data_root = args.root
-    weights = None
+
+    # Sentinel values — overwritten by the active dataset branch below
+    dataset = None
+    train_subjects = []
+    val_subjects = []
+    _seizeit2_train_loader = None
+    _seizeit2_val_loader = None
+    num_classes = 2
+    num_modal = 1
+    modalities = []
+
     if args.dataset == "siscientisst":
         dataset = ScientISSTMOVEDataset(root=data_root, window_sec=args.window_sec, stride_sec=args.stride_sec,
                                         none_policy="ignore")
@@ -1038,24 +1136,169 @@ if __name__ == "__main__":
                 ModalityConfig('w', 6, 10, 2),
             ]
     elif args.dataset == "mhealth":
-        dataset = MHealthDataset(args.root, subjects=[i for i in range(0, 11)], time_steps=50, step=25,
-                                 balance=False, majority_n=500, sample_rate=25)
+        dataset = MHealthDataset(args.root, subjects=[i for i in range(0, 11)], time_steps=100, step=50,
+                                 balance=False, majority_n=500)
         train_subjects = [i for i in range(1, 8)]
         val_subjects = [8, 9, 10]
         num_classes = 12
         weights = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
         weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
-        num_modal = 13
+        num_modal = 12
         if not args.use_device_wise_model:
             modalities = [
                 ModalityConfig(f'm{i}', 1, 10, 0) for i in range(num_modal)
             ]
         else:
             modalities = [
-                ModalityConfig('ecg', 1, 5, 2),
-                ModalityConfig('al', 3, 5, 0), ModalityConfig('gl', 3, 5, 0),
-                ModalityConfig('ar', 3, 5, 1), ModalityConfig('gr', 3, 5, 1),
+                ModalityConfig('al', 3, 10, 0), ModalityConfig('gl', 3, 10, 0),
+                ModalityConfig('ar', 3, 10, 1), ModalityConfig('gr', 3, 10, 1),
             ]
+    elif args.dataset == "seizeit2":
+        # SeizeIT2 (ds005873): wearable multimodal epilepsy seizure detection.
+        # ~41 M windows total / ~330 K per subject — SequentialDataset cannot be used
+        # (would require holding several GB per subject in RAM).
+        # Instead we build plain shuffled DataLoaders (ImageFolder-style) and pass them
+        # directly to AgentSequentialTrainer, which wraps each (x, y) batch into a
+        # length-1 SequentialBatch inside train_step_bptt / validate.
+        all_subjects = [f"sub-{i:03d}" for i in range(1, 126)]
+        np.random.seed(42)
+        _perm      = np.random.permutation(len(all_subjects))
+        _split     = int(len(all_subjects) * 0.8)
+        train_subjects = sorted([all_subjects[i] for i in _perm[:_split]])
+        val_subjects   = sorted([all_subjects[i] for i in _perm[_split:]])
+
+        num_classes = 2
+        # SeizeIT2 stores modalities in separate sub-directories:
+        #   ses-01/eeg/*_eeg.edf  → 2 EEG channels  (256 Hz → resampled to 250)
+        #   ses-01/ecg/*_ecg.edf  → 1 ECG channel
+        #   ses-01/mov/*_mov.edf  → 12 MOV channels (dual 6-axis IMU)
+        # Total: 15 channels per recording run.
+        num_modal   = 15
+        if not args.use_device_wise_model:
+            modalities = [ModalityConfig(f"m{i}", 1, 25, 0) for i in range(num_modal)]
+        else:
+            modalities = [
+                ModalityConfig('eeg',  2, 25, 0),
+                ModalityConfig('ecg',  1, 25, 1),
+                ModalityConfig('mov', 12, 25, 2),
+            ]
+
+        _base_train = SeizeIT2Dataset(
+            data_root=data_root, subjects=train_subjects,
+            time_steps=500, step=500,
+            modalities=('eeg', 'ecg', 'mov'), balance=False,
+            cache_dir=args.cache_dir,
+        )
+        _base_val = SeizeIT2Dataset(
+            data_root=data_root, subjects=val_subjects,
+            time_steps=500, step=500,
+            modalities=('eeg', 'ecg', 'mov'), balance=False,
+            cache_dir=args.cache_dir,
+        )
+
+        # ------------------------------------------------------------------
+        # --preprocess_seizeit2: extract all windows to numpy files and exit
+        # ------------------------------------------------------------------
+        if args.preprocess_seizeit2:
+            assert args.preextracted_dir, "--preextracted_dir must be set with --preprocess_seizeit2"
+            if local_rank == 0:
+                log_info("=== Pre-extracting train set ===")
+                preextract_to_dir(_base_train, args.preextracted_dir)
+                log_info("=== Pre-extracting val set ===")
+                preextract_to_dir(_base_val,   args.preextracted_dir)
+                log_info("Pre-extraction complete. Re-run without --preprocess_seizeit2 to train.")
+            import sys; sys.exit(0)
+
+        _nw = args.num_data_workers
+
+        if args.preextracted_dir:
+            # ------------------------------------------------------------------
+            # Fast path: memmap-backed IterableDataset — same BPTT semantics as
+            # the NFS path but reads from local SSD (no EDF parsing, no OOM).
+            # Supports larger batch_size (e.g. 16-32) than the NFS path.
+            # ------------------------------------------------------------------
+            _train_pre = SeizeIT2PreextractedIterableDataset(
+                args.preextracted_dir, train_subjects,
+                rank=local_rank, world_size=world_size, shuffle=True,
+                expected_channels=num_modal,
+            )
+            _val_pre = SeizeIT2PreextractedIterableDataset(
+                args.preextracted_dir, val_subjects,
+                rank=local_rank, world_size=world_size, shuffle=False,
+                expected_channels=num_modal,
+            )
+
+            def _pad_collate_pre(batch):
+                xs, ys = zip(*batch)
+                max_len = max(x.shape[0] for x in xs)
+                C, T = xs[0].shape[1], xs[0].shape[2]
+                xs_pad = torch.zeros(len(xs), max_len, C, T)
+                ys_pad = torch.full((len(xs), max_len), -100, dtype=torch.long)
+                for i, (x, y) in enumerate(zip(xs, ys)):
+                    n = x.shape[0]
+                    xs_pad[i, :n] = x
+                    ys_pad[i, :n] = y
+                return xs_pad, ys_pad
+
+            _pf = 1 if _nw > 0 else None
+            _seizeit2_train_loader = DataLoader(
+                _train_pre, batch_size=args.batch_size, shuffle=False,
+                num_workers=_nw, pin_memory=False,
+                persistent_workers=(_nw > 0), prefetch_factor=_pf,
+                collate_fn=_pad_collate_pre,
+            )
+            _seizeit2_val_loader = DataLoader(
+                _val_pre, batch_size=args.batch_size, shuffle=False,
+                num_workers=_nw, pin_memory=False,
+                persistent_workers=(_nw > 0), prefetch_factor=_pf,
+                collate_fn=_pad_collate_pre,
+            )
+        else:
+            # ------------------------------------------------------------------
+            # NFS path: IterableDataset, yields full recordings for BPTT
+            # ------------------------------------------------------------------
+            _train_ds = SeizeIT2IterableDataset(
+                _base_train, bptt_steps=args.bptt_steps,
+                rank=local_rank, world_size=world_size, shuffle=True,
+                expected_channels=num_modal,
+            )
+            _val_ds = SeizeIT2IterableDataset(
+                _base_val, bptt_steps=args.bptt_steps,
+                rank=local_rank, world_size=world_size, shuffle=False,
+                expected_channels=num_modal,
+
+            )
+
+            # Pad variable-length recordings so they can be stacked in a batch
+            def _pad_collate(batch):
+                xs, ys = zip(*batch)
+                max_len = max(x.shape[0] for x in xs)
+                C, T = xs[0].shape[1], xs[0].shape[2]
+                xs_pad = torch.zeros(len(xs), max_len, C, T)
+                ys_pad = torch.full((len(xs), max_len), -100, dtype=torch.long)
+                for i, (x, y) in enumerate(zip(xs, ys)):
+                    n = x.shape[0]
+                    xs_pad[i, :n] = x
+                    ys_pad[i, :n] = y
+                return xs_pad, ys_pad
+
+            # Full recordings are ~180 MB each; limit prefetch to 1 to avoid OOM.
+            _pf = 1 if _nw > 0 else None
+            _seizeit2_train_loader = DataLoader(
+                _train_ds, batch_size=args.batch_size, shuffle=False,
+                num_workers=_nw, pin_memory=False,
+                persistent_workers=(_nw > 0), prefetch_factor=_pf,
+                collate_fn=_pad_collate,
+            )
+            _seizeit2_val_loader = DataLoader(
+                _val_ds, batch_size=args.batch_size, shuffle=False,
+                num_workers=_nw, pin_memory=False,
+                persistent_workers=(_nw > 0), prefetch_factor=_pf,
+                collate_fn=_pad_collate,
+            )
+
+        dataset = None   # not used — loaders are passed directly
+
     elif args.dataset == "hmc":
         global_stats = {"mean": np.array([9.1890168e-01, 1.9557451e+00, 2.4014959e+00, 1.6120193e+00,
                         7.8689933e-05, 1.9333732e+00, 3.5932889e+00, 2.4175742e+00]),
@@ -1099,42 +1342,63 @@ if __name__ == "__main__":
         modalities = [
             ModalityConfig(f'm{i}', 1, 30, 0) for i in range(num_modal)
         ]
-    elif args.dataset == "wesad":
-        # dataset = WESADDataset(args.root, [2,3,4,5,6,7,8,9,10,11,13,14,15,16,17], window_sec=1, target_fs=100)
-        # train_subjects = [2,3,4,5,6,7,8,9,10,11,13,14]
-        # val_subjects = [15,16,17]
-        dataset = WESADDataset(args.root, [2, 17], window_sec=30, step_sec=15, target_fs=100)
-        train_subjects = [2]
-        val_subjects = [17]
-        num_classes = 3
-        num_modal = 14
-        if not args.use_device_wise_model:
-            modalities = [
-                ModalityConfig('chest_ecg', 1, 10, 0),
-                ModalityConfig('chest_emg', 1, 10, 0),
-                ModalityConfig('chest_eda', 1, 10, 0),
-                ModalityConfig('chest_resp', 1, 10, 0),
-                ModalityConfig('chest_temp', 1, 10, 0),
-                ModalityConfig('chest_acc_x', 1, 10, 0),
-                ModalityConfig('chest_acc_y', 1, 10, 0),
-                ModalityConfig('chest_acc_z', 1, 10, 0),
+    elif args.dataset == "emowear":
+        # EmoWear (Zenodo 10407279): 49 subjects, 38 trials × 60 s, 5 devices, FS=64 Hz
+        # Default modalities: ECG, RSP (BH3); BVP, EDA, SKT, ACC (E4); ACC, GYRO (front STb)
+        # → 14 channels total
+        _emowear_modalities = ('ecg', 'rsp', 'bvp', 'eda', 'skt', 'acc_e4',
+                               'acc_front', 'gyro_front')
+        _emowear_label_mode = args.emowear_label
+        num_classes = 4 if _emowear_label_mode == 'quadrant' else 2
+        modalities = emowear_modality_configs(_emowear_modalities, patch_size=8)
+        num_modal = sum(m.in_ch for m in modalities)  # 14
 
-                ModalityConfig('wrist_acc_x', 1, 10, 1),
-                ModalityConfig('wrist_acc_y', 1, 10, 1),
-                ModalityConfig('wrist_acc_z', 1, 10, 1),
-                ModalityConfig('wrist_bvp', 1, 10, 1),
-                ModalityConfig('wrist_eda', 1, 10, 1),
-                ModalityConfig('wrist_temp', 1, 10, 1),
-            ]
-        else:
-            # Device-wise grouping (optional)
-            modalities = [
-                ModalityConfig('chest', 8, 10, 0),
-                ModalityConfig('wrist', 6, 10, 1),
-            ]
+        # Discover all subjects and split 80/20
+        _all_emowear_subs = EmoWearDataset(data_root)._discover_subjects()
+        np.random.seed(42)
+        _perm = np.random.permutation(len(_all_emowear_subs))
+        _split = int(len(_all_emowear_subs) * 0.8)
+        train_subjects = [_all_emowear_subs[i] for i in _perm[:_split]]
+        val_subjects   = [_all_emowear_subs[i] for i in _perm[_split:]]
 
-        weights = torch.tensor([0.6, 1, 2])
-        weights = weights.to(torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'))
+        dataset = EmoWearDataset(
+            data_root=data_root,
+            subjects=train_subjects + val_subjects,
+            time_steps=384,   # 6 s at 64 Hz
+            step=64,          # 1 s stride
+            modalities=_emowear_modalities,
+            label_mode=_emowear_label_mode,
+            balance=False,
+        )
+
+    # elif args.dataset == "wesad":
+    #     dataset = MultiModalWESADDataset(args.root, [2,3], window_sec=10, target_fs=64)
+    #     train_subjects = [2]
+    #     val_subjects = [3]
+    #     num_classes = 3
+    #     num_modal = 14
+    #     if not args.use_device_wise_model:
+    #         modalities = [
+    #             # RespiBAN chest sensor (device 0)
+    #             ModalityConfig('chest_acc', 3, 10, 0),
+    #             ModalityConfig('chest_ecg', 1, 10, 0),
+    #             ModalityConfig('chest_emg', 1, 10, 0),
+    #             ModalityConfig('chest_eda', 1, 10, 0),
+    #             ModalityConfig('chest_temp', 1, 10, 0),
+    #             ModalityConfig('chest_resp', 1, 10, 0),
+    #
+    #             # Empatica E4 wrist sensor (device 1)
+    #             ModalityConfig('wrist_acc', 3, 10, 1),
+    #             ModalityConfig('wrist_bvp', 1, 10, 1),
+    #             ModalityConfig('wrist_eda', 1, 10, 1),
+    #             ModalityConfig('wrist_temp', 1, 10, 1),
+    #         ]
+    #     else:
+    #         # Device-wise grouping (optional)
+    #         modalities = [
+    #             ModalityConfig('chest', 8, 10, 0),
+    #             ModalityConfig('wrist', 6, 10, 1),
+    #         ]
 
     if args.use_device_wise_model:
         model = build_former_device(num_classes=num_classes, model_dim=512, return_mem=True, modalities=modalities, modal_fusion=args.modal_fusion)
@@ -1159,36 +1423,45 @@ if __name__ == "__main__":
             "ddp_port": args.port
         }
 
-    trainer = create_agent_trainer_from_dataset(
-        dataset=dataset,
-        train_subject_ids=train_subjects,
-        val_subject_ids=val_subjects,
-        model=model,
-        agent=agent,
-        trainer_config={
-            "save_dir": args.save_dir,
-            "batch_size": args.batch_size,
-            "bptt_steps": args.bptt_steps,
-            "ce_weight": args.ce_weight,
-            "gating_weight": args.gating_weight,
-            "learning_rate": args.model_lr,
-            "agent_learning_rate": args.agent_lr,
-            "use_amp": True,
-            "grad_clip_norm": 1.0,
-            "val_interval": 1,
-            "mem_context_cache_length": args.mem_context_cache_length,
-            "use_contrastive_loss": args.use_contrastive_loss,
-            "contrastive_weight": args.contrastive_weight,
-            "contrastive_tau": args.contrastive_tau,
-            "memory_bank_size": args.memory_bank_size,
-            "use_predictive_loss": args.use_predictive_loss,
-            "predictive_weight": args.predictive_weight,
-            "predictive_offset": args.predictive_offset,
-            "only_predictive": args.only_predictive,
-            "cls_weights": None
-        },
-        ddp_config=ddp_config
-    )
+    _trainer_config = {
+        "batch_size": args.batch_size,
+        "bptt_steps": args.bptt_steps,
+        "ce_weight": args.ce_weight,
+        "gating_weight": args.gating_weight,
+        "learning_rate": args.model_lr,
+        "agent_learning_rate": args.agent_lr,
+        "use_amp": True,
+        "grad_clip_norm": 1.0,
+        "val_interval": 1,
+        "mem_context_cache_length": args.mem_context_cache_length,
+        "use_contrastive_loss": args.use_contrastive_loss,
+        "contrastive_weight": args.contrastive_weight,
+        "contrastive_tau": args.contrastive_tau,
+        "memory_bank_size": args.memory_bank_size,
+        "use_predictive_loss": args.use_predictive_loss,
+        "predictive_weight": args.predictive_weight,
+        "predictive_offset": args.predictive_offset,
+        "only_predictive": args.only_predictive
+    }
+
+    if args.dataset == "seizeit2":
+        # Plain-loader path: bypass SequentialDataset
+        trainer = create_agent_trainer_from_dataset(
+            model=model, agent=agent,
+            train_loader=_seizeit2_train_loader,
+            val_loader=_seizeit2_val_loader,
+            trainer_config=_trainer_config,
+            ddp_config=ddp_config,
+        )
+    else:
+        trainer = create_agent_trainer_from_dataset(
+            dataset=dataset,
+            train_subject_ids=train_subjects,
+            val_subject_ids=val_subjects,
+            model=model, agent=agent,
+            trainer_config=_trainer_config,
+            ddp_config=ddp_config,
+        )
 
     trainer.train(num_epochs=args.num_epochs)
     trainer.cleanup()
