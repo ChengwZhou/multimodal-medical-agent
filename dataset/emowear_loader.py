@@ -50,6 +50,8 @@ Label modes
 import os
 import re
 import glob
+import hashlib
+import pickle
 import logging
 import numpy as np
 import pandas as pd
@@ -147,6 +149,46 @@ def _resample_to_grid(ts: np.ndarray, vals: np.ndarray,
     return out
 
 
+def _read_signal_raw(csv_path: str, value_cols: List[str]
+                     ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Read a signal CSV once, return (ts [N], vals [N, C]) without slicing.
+
+    Used by the caching path in ``_load_subject`` to avoid re-reading the
+    same file for every trial.  Returns ``None`` on any read / parse failure.
+    """
+    if not os.path.exists(csv_path):
+        return None
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        return None
+
+    # Flexible timestamp column matching
+    ts_col = None
+    for c in df.columns:
+        if 'timestamp' in c.lower():
+            ts_col = c
+            break
+    if ts_col is None:
+        return None
+
+    # Flexible value column matching
+    resolved = []
+    for vc in value_cols:
+        if vc in df.columns:
+            resolved.append(vc)
+        else:
+            matches = [c for c in df.columns if c.lower().startswith(vc.lower())]
+            if matches:
+                resolved.append(matches[0])
+            else:
+                return None  # required column absent
+
+    ts   = df[ts_col].to_numpy(dtype=np.float64)
+    vals = df[resolved].to_numpy(dtype=np.float32)
+    return ts, vals
+
+
 def _read_signal(csv_path: str, value_cols: List[str],
                  t_start: float, t_end: float) -> Optional[np.ndarray]:
     """Read one signal CSV and interpolate to the target 64-Hz grid.
@@ -216,6 +258,11 @@ class EmoWearDataset(Dataset):
         balance_ratio: Used only when ``balance=True``.
         global_stats:  Optional ``{'mean': [C], 'std': [C]}`` for z-score.
                        If ``None``, per-window z-score is applied.
+        cache_dir:     Directory for per-subject pickle caches.  Defaults to
+                       ``{data_root}/.emowear_cache``.  Pass ``False``/an
+                       empty string to disable caching (not recommended).
+                       Cache filenames embed a hash of all preprocessing
+                       parameters, so changing any param auto-invalidates.
     """
 
     FS: int = FS
@@ -232,6 +279,7 @@ class EmoWearDataset(Dataset):
         balance: bool = False,
         balance_ratio: int = 3,
         global_stats: Optional[Dict[str, np.ndarray]] = None,
+        cache_dir: Optional[str] = None,  # None → {data_root}/.emowear_cache
     ):
         self.data_root   = data_root
         self.modalities  = list(modalities)
@@ -242,6 +290,8 @@ class EmoWearDataset(Dataset):
         self.balance     = balance
         self.balance_ratio = balance_ratio
         self.global_stats  = global_stats
+        self.cache_dir   = cache_dir if cache_dir is not None \
+                           else os.path.join(data_root, '.emowear_cache')
 
         # Discover subjects
         if subjects is None:
@@ -280,25 +330,80 @@ class EmoWearDataset(Dataset):
         return sorted(found)
 
     # ------------------------------------------------------------------
+    # Cache key
+    # ------------------------------------------------------------------
+
+    def _cache_key(self) -> str:
+        """Short hash that encodes all preprocessing parameters.
+
+        A change to any of time_steps / step / modalities / label_mode /
+        threshold will produce a different key, ensuring stale caches are
+        never re-used.
+        """
+        sig = (
+            self.time_steps,
+            self.step,
+            tuple(sorted(self.modalities)),
+            self.label_mode,
+            round(self.threshold, 6),
+        )
+        h = hashlib.md5(str(sig).encode()).hexdigest()[:10]
+        return h
+
+    # ------------------------------------------------------------------
     # Index build
     # ------------------------------------------------------------------
 
     def _build_index(self):
-        """Load all trials for all subjects, apply sliding window, build index."""
+        """Load all trials for all subjects, apply sliding window, build index.
+
+        Per-subject windows are persisted to ``{cache_dir}/{subj}_{key}.pkl``
+        so that subsequent runs skip all CSV parsing and signal resampling.
+        The cache is keyed by preprocessing parameters (time_steps, step,
+        modalities, label_mode, threshold); changing any parameter
+        automatically invalidates the cache.
+        """
+        os.makedirs(self.cache_dir, exist_ok=True)
+        key = self._cache_key()
+
         for subj in self.subjects:
             subj_dir = os.path.join(self.data_root, subj)
             if not os.path.isdir(subj_dir):
                 log_info(f"  {subj}: folder not found, skipping")
                 continue
 
-            wins = self._load_subject(subj, subj_dir)
+            cache_path = os.path.join(self.cache_dir, f"{subj}_{key}.pkl")
+            if os.path.exists(cache_path):
+                try:
+                    with open(cache_path, 'rb') as f:
+                        wins = pickle.load(f)
+                    log_info(f"  {subj}: {len(wins)} windows (from cache)")
+                except Exception as e:
+                    log_info(f"  {subj}: cache load failed ({e}), reprocessing")
+                    wins = None
+            else:
+                wins = None
+
+            if wins is None:
+                wins = self._load_subject(subj, subj_dir)
+                try:
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(wins, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    log_info(f"  {subj}: {len(wins)} windows (cached → {cache_path})")
+                except Exception as e:
+                    log_info(f"  {subj}: {len(wins)} windows (cache write failed: {e})")
+
             self.subject_to_windows[subj] = wins
             self._windows.extend(wins)
-            log_info(f"  {subj}: {len(wins)} windows")
 
     def _load_subject(self, subj: str, subj_dir: str
                       ) -> List[Tuple[np.ndarray, int]]:
-        """Load markers + surveys + signals for one subject."""
+        """Load markers + surveys + signals for one subject.
+
+        Speed: read each signal CSV exactly once per subject, cache as raw
+        numpy arrays, then slice per-trial.  Avoids the original pattern of
+        38 trials × 8 modalities = 304 redundant full-file CSV parses.
+        """
         # --- Markers ---
         mk_path = os.path.join(subj_dir, 'markers-phase2.csv')
         if not os.path.exists(mk_path):
@@ -323,36 +428,68 @@ class EmoWearDataset(Dataset):
 
         # Merge markers + surveys on 'seq'
         if 'seq' not in markers.columns or 'seq' not in surveys.columns:
-            log_info(f"  {subj}: missing 'seq' column in markers or surveys")
+            log_info(f"  {subj}: missing 'seq' column in markers or surveys, "
+                     f"markers cols={list(markers.columns)}, surveys cols={list(surveys.columns)}")
             return []
         merged = markers.merge(surveys, on='seq', how='inner')
+        if merged.empty:
+            log_info(f"  {subj}: markers/surveys merge is empty (check 'seq' values match)")
+            return []
+
+        # vidB column check
+        if 'vidB' not in merged.columns:
+            log_info(f"  {subj}: 'vidB' column missing from markers, "
+                     f"available={list(merged.columns)}")
+            return []
+
+        # ------------------------------------------------------------------
+        # Pre-load every signal CSV once and cache as (ts [N], vals [N,C]).
+        # Original _read_signal re-opened the file for each of the 38 trials
+        # (304 full reads per subject).  Now we read each CSV once.
+        # ------------------------------------------------------------------
+        sig_cache: Dict[str, Optional[Tuple[np.ndarray, np.ndarray]]] = {}
+        for mod in self.modalities:
+            csv_file, val_cols, _, _ = SIGNAL_CONFIG[mod]
+            csv_path = os.path.join(subj_dir, csv_file)
+            sig_cache[mod] = _read_signal_raw(csv_path, val_cols)
+
+        # Diagnose missing modalities once (not once per trial)
+        missing = [m for m in self.modalities if sig_cache[m] is None]
+        if missing:
+            log_info(f"  {subj}: signal(s) missing or unreadable: {missing} — all trials skipped")
+            return []
 
         windows = []
+        n_skip_label = 0
+        n_skip_signal = 0
         for _, row in merged.iterrows():
-            # Video onset / offset
-            if 'vidB' not in row or pd.isna(row['vidB']):
+            if pd.isna(row['vidB']):
                 continue
             t_start = float(row['vidB'])
             t_end   = t_start + TRIAL_DUR
 
-            # Label
             label = self._make_label(row)
             if label is None:
+                n_skip_label += 1
                 continue
 
-            # Load and concatenate signals
-            channels = self._load_signals(subj_dir, t_start, t_end)
+            # Slice pre-loaded signals for this trial window
+            channels = self._slice_signals(sig_cache, t_start, t_end)
             if channels is None:
-                continue                 # one or more required signals missing
+                n_skip_signal += 1
+                continue
 
-            # Sliding window over this trial's signal matrix
-            T_total = channels.shape[0]  # [T_total, C]
+            T_total = channels.shape[0]
             for s in range(0, T_total - self.time_steps + 1, self.step):
-                seg = channels[s : s + self.time_steps, :]   # [T, C]
-                x   = seg.T.astype(np.float32)               # [C, T]
+                seg = channels[s : s + self.time_steps, :]
+                x   = seg.T.astype(np.float32)
                 x   = self._normalize(x)
                 windows.append((x, label))
 
+        if not windows:
+            log_info(f"  {subj}: 0 windows — "
+                     f"trials={len(merged)}, skipped(label)={n_skip_label}, "
+                     f"skipped(signal)={n_skip_signal}")
         return windows
 
     def _make_label(self, row) -> Optional[int]:
@@ -398,6 +535,41 @@ class EmoWearDataset(Dataset):
                 arr = np.concatenate([arr, pad], axis=0)
             channel_arrays.append(arr)
 
+        return np.concatenate(channel_arrays, axis=1)  # [T, C_total]
+
+    def _slice_signals(self, sig_cache: Dict[str, Optional[Tuple[np.ndarray, np.ndarray]]],
+                       t_start: float, t_end: float) -> Optional[np.ndarray]:
+        """Slice pre-cached signal arrays to a trial window and stack into [T, C].
+
+        Args:
+            sig_cache: ``{modality: (ts [N], vals [N,C])}`` built once per subject.
+            t_start:   Trial window start (seconds).
+            t_end:     Trial window end (seconds).
+
+        Returns:
+            ``[T_target, C_total] float32`` or ``None`` if any modality is missing
+            / has insufficient coverage.
+        """
+        n_target = round(TRIAL_DUR * FS)
+        margin = 1.0
+        channel_arrays = []
+        for mod in self.modalities:
+            cached = sig_cache[mod]
+            if cached is None:
+                return None
+            ts, vals = cached
+            # Trim to window + small margin to avoid edge extrapolation artefacts
+            mask = (ts >= t_start - margin) & (ts <= t_end + margin)
+            if mask.sum() < 2:
+                return None
+            arr = _resample_to_grid(ts[mask], vals[mask], t_start, t_end)  # [T, C_mod]
+            # Trim / pad to exactly n_target samples
+            if arr.shape[0] >= n_target:
+                arr = arr[:n_target]
+            else:
+                pad = np.zeros((n_target - arr.shape[0], arr.shape[1]), dtype=np.float32)
+                arr = np.concatenate([arr, pad], axis=0)
+            channel_arrays.append(arr)
         return np.concatenate(channel_arrays, axis=1)  # [T, C_total]
 
     def _normalize(self, x: np.ndarray) -> np.ndarray:

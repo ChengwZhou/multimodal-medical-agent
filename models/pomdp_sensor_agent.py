@@ -22,7 +22,7 @@ where a*_t is the oracle-optimal action in hindsight.
 Gumbel-Sigmoid is equivalent to Thompson Sampling on Bernoulli arms:
   • Each arm k has an unknown expected reward μ_k ∝ σ(logit_k)
   • Gumbel noise g ~ Gumbel(0,1) is equivalent to posterior perturbation
-  • σ((logit_k + g_k) / τ) ≈ sampling from a Gumbel-softmax posterior
+  • σ(logit_k / τ_eff + g_k) ≈ sampling from a Gumbel-softmax posterior
   • Thompson Sampling achieves: E[R_T] = O( √(M · T · log T) )
     (Russo & Van Roy 2016; Agrawal & Goyal 2012)
 
@@ -48,31 +48,6 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# _AlwaysDropout — for MC-Dropout uncertainty estimation
-# ---------------------------------------------------------------------------
-
-class _AlwaysDropout(nn.Module):
-    """
-    Dropout that remains active even during eval mode.
-
-    Standard nn.Dropout is disabled when the module is in eval mode, making
-    it deterministic at inference.  _AlwaysDropout stays stochastic, so that
-    running K forward passes through the same policy head gives K different
-    logit samples — the variance across these samples is the MC-Dropout
-    estimate of epistemic uncertainty.
-
-    Usage: substitute for nn.Dropout inside the policy head when
-    uncertainty_type='mc_dropout'.
-    """
-    def __init__(self, p: float = 0.1):
-        super().__init__()
-        self.p = p
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.dropout(x, p=self.p, training=True, inplace=False)
-
-
-# ---------------------------------------------------------------------------
 # AgentOutput dataclass
 # ---------------------------------------------------------------------------
 
@@ -88,93 +63,6 @@ class AgentOutput:
     energy_cost:   torch.Tensor            # [B]     mean gate activation (proxy energy)
     state_changes: torch.Tensor            # [B]     #sensors that changed state
     uncertainty:   Optional[torch.Tensor] = None  # [B, M] epistemic std per sensor; None when disabled
-
-
-# ---------------------------------------------------------------------------
-# LagrangianSparsityController
-# ---------------------------------------------------------------------------
-
-class LagrangianSparsityController:
-    """
-    Lagrangian relaxation for a per-step sparsity budget constraint.
-
-    Optimisation problem
-    --------------------
-        min_θ  L_task(θ)
-        s.t.   E[active_ratio] ≤ target_sparsity
-
-    Lagrangian dual
-    ---------------
-        L(θ, μ) = L_task(θ) + μ · max(0, ρ̂ − target)
-
-    where ρ̂ is an EMA of the observed active_ratio and μ ≥ 0 is the
-    Lagrange multiplier updated by gradient ascent on the dual:
-
-        μ ← clip( μ + lr_dual · (ρ̂ − target),  0, μ_max )
-
-    Usage in training loop
-    ----------------------
-        ctrl = LagrangianSparsityController(target_sparsity=0.4)
-        ...
-        sparsity_loss = mean(active_ratios)          # from sensing_info
-        mu = ctrl.update(sparsity_loss.item())       # update dual var
-        loss = ce_loss + ctrl.penalty(sparsity_loss) # add to total loss
-    """
-
-    def __init__(
-        self,
-        target_sparsity: float = 0.5,   # max acceptable active_ratio
-        lr_dual: float = 5e-3,          # dual ascent step size
-        mu_init: float = 0.0,
-        mu_max: float = 20.0,
-        ema_alpha: float = 0.05,        # EMA smoothing (smaller = slower)
-    ):
-        self.target    = target_sparsity
-        self.lr_dual   = lr_dual
-        self.mu        = mu_init
-        self.mu_max    = mu_max
-        self.ema_alpha = ema_alpha
-        self._ema      = target_sparsity   # initialise EMA at target
-
-    # ------------------------------------------------------------------
-
-    def update(self, observed_ratio: float) -> float:
-        """
-        Update the EMA estimate of active_ratio and the dual variable μ.
-        Call once per training step (or per batch).
-
-        Returns the current μ for logging.
-        """
-        self._ema = (1.0 - self.ema_alpha) * self._ema + self.ema_alpha * observed_ratio
-        violation  = self._ema - self.target
-        self.mu    = float(max(0.0, min(self.mu_max, self.mu + self.lr_dual * violation)))
-        return self.mu
-
-    def penalty(self, active_ratio_tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Return μ · active_ratio  (add this to the task loss).
-        Uses the current frozen μ — call update() first.
-        """
-        return self.mu * active_ratio_tensor
-
-    # ------------------------------------------------------------------
-    # Properties for logging
-    # ------------------------------------------------------------------
-
-    @property
-    def current_mu(self) -> float:
-        return self.mu
-
-    @property
-    def ema_ratio(self) -> float:
-        return self._ema
-
-    def state_dict(self) -> Dict:
-        return {"mu": self.mu, "ema": self._ema}
-
-    def load_state_dict(self, d: Dict):
-        self.mu   = d["mu"]
-        self._ema = d["ema"]
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +136,7 @@ class BeliefStatePOMDPAgent(nn.Module):
       3. Update belief:      b_t   = GRU(enc_t, b_{t-1})               [B, H]
       4. Encode history:     hist_enc = MLP(flatten(sensor_history))    [B, H/2]
       5. Gate logits:        logit = PolicyMLP([b_t, hist_enc])         [B, M]
-      6. Gumbel-Sigmoid:     p_soft = σ((logit + Gumbel) / τ)          [B, M]
+      6. Gumbel-Sigmoid:     p_soft = σ(logit / τ_eff + Gumbel)        [B, M]
       7. STE hard gate:      p_st   = round(p_soft.detach()) + p_soft − p_soft.detach()
       8. Value baseline:     V      = ValueMLP(b_t)                     [B, 1]
 
@@ -272,11 +160,12 @@ class BeliefStatePOMDPAgent(nn.Module):
         obs_dim: int,
         hidden_dim: int = 256,
         history_length: int = 10,
-        tau: float = 1.0,              # fixed Gumbel-sigmoid temperature (no annealing)
+        tau: float = 1.0,              # fixed τ ("none"/"logit") or τ_max ("none_annealing")
+        tau_min: float = 0.1,          # τ floor for "none_annealing" mode
+        tau_anneal_steps: int = 5000,  # steps over which τ decays from tau → tau_min
         modal_per: int = 64,           # per-modality embedding dim for direct policy input
-        # Uncertainty-aware exploration (addresses TS approximation gap)
-        uncertainty_type: str = "none",   # "none" | "ensemble" | "mc_dropout"
-        ensemble_k: int = 5,              # K heads (ensemble) or K MC passes (mc_dropout)
+        # Uncertainty-aware exploration
+        uncertainty_type: str = "none",   # "none" | "logit" | "none_annealing"
         uncertainty_scale: float = 1.0,   # how strongly uncertainty widens per-sensor τ
     ):
         super().__init__()
@@ -286,17 +175,20 @@ class BeliefStatePOMDPAgent(nn.Module):
         self.history_length    = history_length
         self.modal_per         = modal_per
         self.uncertainty_type  = uncertainty_type
-        self.ensemble_k        = ensemble_k
         self.uncertainty_scale = uncertainty_scale
 
-        if uncertainty_type not in ("none", "ensemble", "mc_dropout"):
+        if uncertainty_type not in ("none", "logit", "none_annealing"):
             raise ValueError(
-                f"uncertainty_type must be 'none'|'ensemble'|'mc_dropout', got {uncertainty_type!r}"
+                f"uncertainty_type must be 'none'|'logit'|'none_annealing', got {uncertainty_type!r}"
             )
 
-        # Fixed temperature — saved as buffer so checkpoints are self-contained.
-        # No annealing: late-training gradients stay healthy regardless of epoch count.
-        self.register_buffer("_tau", torch.tensor(tau))
+        # Temperature buffers — all modes store _tau (max/fixed τ).
+        # Annealing mode additionally uses _tau_min, _tau_anneal_steps, _anneal_step.
+        # Buffers are saved in checkpoints so training can resume seamlessly.
+        self.register_buffer("_tau",              torch.tensor(float(tau)))
+        self.register_buffer("_tau_min",          torch.tensor(float(tau_min)))
+        self.register_buffer("_tau_anneal_steps", torch.tensor(int(tau_anneal_steps)))
+        self.register_buffer("_anneal_step",      torch.zeros(1, dtype=torch.long))
 
         # ---- Per-modality encoder -------------------------------------------
         # Shared linear: maps each modality's mean-pooled representation
@@ -327,43 +219,28 @@ class BeliefStatePOMDPAgent(nn.Module):
             nn.LayerNorm(hidden_dim // 2),
         )
 
-        # ---- Policy head(s) --------------------------------------------------
-        # Three modes controlled by uncertainty_type:
+        # ---- Policy head -----------------------------------------------------
+        # Single shared MLP for both modes.
         #
-        #   "none"       → single policy_head  (original behaviour, zero overhead)
-        #   "ensemble"   → K independent policy_heads; uncertainty = std of their logits.
-        #                  Different random inits give diverse predictions.
-        #                  Optional diversity loss prevents head collapse.
-        #   "mc_dropout" → single policy_head with _AlwaysDropout (active at eval);
-        #                  K stochastic passes → variance = MC-Dropout uncertainty.
-        #
-        # Adaptive temperature:  τ_eff[b,m] = τ · (1 + uncertainty_scale · σ[b,m])
-        # High uncertainty sensor → wider Gumbel noise → more exploration.
-        # This is what genuine Thompson Sampling provides but fixed-variance
-        # Gumbel noise cannot.
+        #   "none"  → logits only; standard fixed-variance Gumbel exploration.
+        #   "logit" → same logits; uncertainty = normalised binary entropy H(p)/log2 ∈ [0,1]
+        #             p = sigmoid(logit[b,m])
+        #             H = -p·log(p) - (1-p)·log(1-p)   (binary cross-entropy)
+        #             σ[b,m] = H / log(2)  ∈ [0, 1]
+        #             τ_eff[b,m] = τ · (1 + scale · σ[b,m])
+        #             sensor near decision boundary (logit≈0, p≈0.5) → unc≈1 → wider exploration.
+        #             confident sensor (|logit| large) → unc→0 → τ_eff≈τ_base.
+        #             Zero extra compute; guaranteed per-sensor differentiation.
+        #             Much better dynamic range than sigmoid(-|logit|):
+        #               logit=1 → 0.78, logit=2 → 0.53, logit=3 → 0.29  (vs 0.27/0.12/0.05)
         policy_in = hidden_dim + hidden_dim // 2 + num_sensors * modal_per
-
-        if uncertainty_type == "ensemble":
-            self.policy_head  = None   # unused; present as None to avoid AttributeError
-            self.policy_heads = nn.ModuleList([
-                self._build_policy_head(policy_in, hidden_dim, num_sensors, dropout_always=False)
-                for _ in range(ensemble_k)
-            ])
-        else:
-            # "none" or "mc_dropout"
-            self.policy_head = self._build_policy_head(
-                policy_in, hidden_dim, num_sensors,
-                dropout_always=(uncertainty_type == "mc_dropout"),
-            )
-            self.policy_heads = None   # unused
+        self.policy_head = self._build_policy_head(policy_in, hidden_dim, num_sensors)
 
         # value_head removed: it was used only for REINFORCE baseline, but the
         # trainer uses STE + CE gradients exclusively — value_head output was
         # never consumed anywhere in the training loop (dead code).
 
         self._eps = 1e-8
-        # Cache for ensemble diversity loss (set inside _compute_logits_and_uncertainty)
-        self._last_logits_k: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
     # Policy head factory (static — no self needed)
@@ -374,30 +251,41 @@ class BeliefStatePOMDPAgent(nn.Module):
         policy_in: int,
         hidden_dim: int,
         num_sensors: int,
-        dropout_always: bool = False,
     ) -> nn.Sequential:
-        """
-        Build a policy MLP: policy_in → hidden → hidden/2 → num_sensors.
-
-        dropout_always=True uses _AlwaysDropout so the head stays stochastic
-        at eval time — required for MC-Dropout uncertainty sampling.
-        """
-        dropout_cls = _AlwaysDropout if dropout_always else nn.Dropout
+        """Shared policy MLP for 'none' mode: policy_in → hidden → hidden/2 → M."""
         head = nn.Sequential(
-            nn.Linear(policy_in, hidden_dim), nn.GELU(), dropout_cls(0.1),
+            nn.Linear(policy_in, hidden_dim), nn.GELU(), nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2), nn.GELU(),
             nn.Linear(hidden_dim // 2, num_sensors),
         )
         nn.init.constant_(head[-1].bias, 2.0)
         return head
 
+
     # ------------------------------------------------------------------
     # Temperature (fixed)
     # ------------------------------------------------------------------
 
     def get_temperature(self) -> torch.Tensor:
-        """Return the fixed Gumbel-sigmoid temperature (no annealing)."""
-        return self._tau
+        """
+        Return the current Gumbel-sigmoid temperature.
+
+        "none" / "logit"   → fixed _tau throughout training.
+        "none_annealing"   → exponential decay:
+                               τ(t) = τ_min + (τ_max − τ_min) · exp(−t / T)
+                             where t = _anneal_step, T = _tau_anneal_steps.
+        """
+        if self.uncertainty_type != "none_annealing":
+            return self._tau
+        t   = self._anneal_step.float()
+        T   = self._tau_anneal_steps.float().clamp(min=1)
+        frac = torch.exp(-t / T)
+        return self._tau_min + (self._tau - self._tau_min) * frac
+
+    def anneal_step(self):
+        """Increment the annealing counter by 1 (call once per training chunk/step)."""
+        if self.uncertainty_type == "none_annealing":
+            self._anneal_step.add_(1)
 
     # ------------------------------------------------------------------
     # Gumbel-Sigmoid
@@ -412,114 +300,251 @@ class BeliefStatePOMDPAgent(nn.Module):
         """
         Continuous Bernoulli relaxation via Gumbel noise injection.
 
-        When uncertainty is provided (ensemble or mc_dropout mode), the effective
-        temperature becomes per-sensor adaptive:
-
-            τ_eff[b, m] = τ · (1 + uncertainty_scale · σ[b, m])
-
-        This is the key property that brings the system closer to Thompson Sampling:
-        sensors the agent is uncertain about receive wider exploration (larger τ),
-        while sensors whose relevance is already clear get sharper decisions (τ ≈ τ_base).
-        Fixed-variance Gumbel noise cannot do this — it explores all sensors equally
-        regardless of how much the agent already knows about each one.
-
-        Derivation (base case, no uncertainty)
-        ----------------------------------------
+        Base case (no uncertainty):
           u ~ Uniform(0,1),  g = -log(-log(u)) ~ Gumbel(0,1)
-          σ((logit + g) / τ)  →  Bernoulli(σ(logit))  as τ → 0
+          σ(logit/τ + g)  →  Bernoulli(σ(logit))  as τ → 0
+
+        When uncertainty is provided ('logit' mode), τ_eff scales only the
+        logit — NOT the combined (logit+g) — so that p_hard is affected:
+
+            τ_eff[b,m] = τ · (1 + uncertainty_scale · H(p)[b,m])
+            p_soft     = σ( logit[b,m] / τ_eff[b,m]  +  g )
+
+        Why this is correct:
+          p_hard = sign(logit/τ_eff + g)
+          P(p_hard=1) = P(g > −logit/τ_eff) ≈ σ(logit/τ_eff)
+
+          • High uncertainty → large τ_eff → logit/τ_eff compressed → g dominates
+            → P(p_hard=1) ≈ 0.5 → maximally exploratory  ✓
+          • Low uncertainty  → τ_eff ≈ τ_base → logit amplified relative to g
+            → P(p_hard=1) ≈ σ(logit/τ_base) → exploitative  ✓
+
+        Previous design σ((logit+g)/τ) had τ cancel out of p_hard entirely
+        (sign((l+g)/τ) = sign(l+g) for τ>0), so uncertainty had no effect on
+        the discrete gate decision — only on gradient magnitude, and in the
+        wrong direction (large τ reduced gradient when logit≈0, where gradient
+        is most informative).
         """
         if uncertainty is not None:
-            # Adaptive per-sensor temperature — [B, M] broadcast
+            # Per-sensor effective temperature — [B, M] broadcast
             tau = tau * (1.0 + self.uncertainty_scale * uncertainty)
 
         if self.training:
             u = torch.rand_like(logits).clamp(self._eps, 1.0 - self._eps)
-            g = -torch.log(-torch.log(u))          # Gumbel(0,1)
-            return torch.sigmoid((logits + g) / tau)
+            g = -torch.log(-torch.log(u))          # Gumbel(0,1), standard scale
+            return torch.sigmoid(logits / tau + g)  # τ compresses logit; g stays full-scale
         else:
-            return torch.sigmoid(logits / tau)     # deterministic (τ still adaptive if given)
+            return torch.sigmoid(logits / tau)     # deterministic; τ still adaptive if given
 
     # ------------------------------------------------------------------
     # Uncertainty estimation
     # ------------------------------------------------------------------
 
     def _compute_logits_and_uncertainty(
-        self, combined: torch.Tensor
+        self,
+        belief:     torch.Tensor,   # [B, H]
+        hist_enc:   torch.Tensor,   # [B, H/2]
+        modal_flat: torch.Tensor,   # [B, M*modal_per]
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Compute gate logits and optional per-sensor epistemic uncertainty.
+        Compute gate logits and optional per-sensor uncertainty.
 
         Returns
         -------
-        logits      : [B, M]  mean logits (or single-head logits when type='none')
-        uncertainty : [B, M]  std across K samples, or None when type='none'
+        logits      : [B, M]
+        uncertainty : [B, M] or None
 
         Mode details
         ------------
-        "none"       — single deterministic forward; uncertainty = None.
-                       Behaviour is identical to the old code.
-        "ensemble"   — K independent heads; uncertainty = std[K, B, M].std(0).
-                       Caches _last_logits_k [K, B, M] for ensemble_diversity_loss().
-        "mc_dropout" — K stochastic passes through the single head (which uses
-                       _AlwaysDropout so dropout is active at eval too);
-                       uncertainty = std across K draws.
-        """
-        if self.uncertainty_type == "none":
-            return self.policy_head(combined), None
+        "none"  — single forward; uncertainty = None; standard fixed-variance Gumbel.
 
-        elif self.uncertainty_type == "ensemble":
-            logits_k = torch.stack(
-                [h(combined) for h in self.policy_heads], dim=0
-            )  # [K, B, M]
-            self._last_logits_k = logits_k   # cache for diversity loss
-            # uncertainty is detached: std(logits_k) is used only to scale τ,
-            # not as a training signal.  Without detach, ∂std/∂logits_k = (x-μ)/(σ·(K-1))
-            # → NaN when σ→0 (heads converge), even with diversity loss.
+        "logit" — same single forward; uncertainty = normalised binary entropy:
+                    p[b,m]   = sigmoid(logit[b,m])
+                    H[b,m]   = -p·log(p) - (1-p)·log(1-p)
+                    σ[b,m]   = H[b,m] / log(2)  ∈ [0, 1]
+                    τ_eff    = τ · (1 + scale · σ[b,m])
+                  Applied as: p_soft = sigmoid(logit / τ_eff + g)
+                  Semantics:
+                    • logit ≈ 0  (p≈0.5) → unc=1 → τ_eff large → logit/τ_eff≈0 → g dominates
+                      → P(p_hard=1)≈0.5 → maximum exploration  ✓
+                    • |logit| large (confident) → unc→0 → τ_eff≈τ_base → logit/τ_base amplified
+                      → P(p_hard=1)≈0 or 1 → exploitation  ✓
+                  Detached from computation graph (used only to scale τ, not as loss).
+        """
+        combined = torch.cat([belief, hist_enc, modal_flat], dim=-1)
+        logits   = self.policy_head(combined)   # [B, M]
+
+        if self.uncertainty_type == "none" or self.uncertainty_type == "none_annealing":
+            return logits, None
+
+        else:  # "logit"
             with torch.no_grad():
-                uncertainty = logits_k.std(dim=0).clamp(max=2.0)   # [B, M], no grad; clamped so τ_eff ≤ τ_base*(1+scale*2)
-            return logits_k.mean(dim=0), uncertainty
+                p   = torch.sigmoid(logits)                           # [B, M] ∈ (0, 1)
+                eps = 1e-7
+                H   = -(  p        * (p        + eps).log()
+                        + (1.0 - p) * (1.0 - p + eps).log() )        # [B, M] ∈ [0, log2]
+                uncertainty = H / 0.6931471805599453                  # [B, M] ∈ [0, 1]
+            return logits, uncertainty
 
-        else:  # "mc_dropout"
-            logits_k = torch.stack(
-                [self.policy_head(combined) for _ in range(self.ensemble_k)], dim=0
-            )  # [K, B, M]
-            with torch.no_grad():
-                uncertainty = logits_k.std(dim=0).clamp(max=2.0)   # [B, M], no grad; clamped
-            return logits_k.mean(dim=0), uncertainty
+    # ------------------------------------------------------------------
+    # FLOPs / parameter breakdown
+    # ------------------------------------------------------------------
 
-    def ensemble_diversity_loss(self) -> Optional[torch.Tensor]:
+    def profile(self, batch_size: int = 1) -> Dict[str, Dict]:
         """
-        Diversity regularisation for ensemble heads (cosine-similarity formulation).
+        Per-layer FLOPs (multiply-adds) and parameter count breakdown.
 
-        Uses mean pairwise *cosine similarity* instead of L2 distance to keep
-        gradients bounded.  L2 gradient grows as 2·(logit_i − logit_j) — once
-        heads diverge the gradient explodes (positive feedback → τ → ∞).
-        Cosine similarity is bounded in [−1, 1] so its gradient is always O(1).
+        FLOPs conventions
+        -----------------
+        Linear(in, out)           : in * out  MACs  (bias negligible)
+        GRUCell(input, hidden)    :
+            3 input gates  × input*hidden  MACs  (W_i{r,z,n})
+            3 hidden gates × hidden*hidden MACs  (W_h{r,z,n})
+            Total                 : 3*hidden*(input + hidden)  MACs
+        LayerNorm(D)              : 2*D  MACs  (normalise + affine)
+        Elementwise (GELU, etc.)  : N    MACs  (1 op per element)
 
-        Sign convention
-        ---------------
-            total_loss += diversity_weight * ensemble_diversity_loss()
+        1 MAC ≈ 2 FLOPs (1 multiply + 1 add).  Results reported in MACs.
+        All counts are *per forward call* (batch_size = 1 by default).
 
-        The raw return value is the mean cosine similarity ∈ [−1, 1].
-        Minimising it → cosine similarity → −1 → maximum angular disagreement ✓
-
-        Trainer logging: disagreement = 1 − div_loss  ∈ [0, 2]  (higher = more diverse).
+        Returns
+        -------
+        dict  module_name → {"params": int, "macs": int}
+        Also prints a formatted table.
         """
-        if self.uncertainty_type != "ensemble" or self._last_logits_k is None:
-            return None
-        logits_k = self._last_logits_k   # [K, B, M]
-        K = logits_k.shape[0]
-        if K < 2:
-            return None
-        # Flatten B and M into a single vector per head for cosine comparison
-        lk = logits_k.reshape(K, -1)                        # [K, B*M]
-        lk_n = F.normalize(lk, dim=-1, eps=1e-8)            # unit-norm rows
-        pairs = []
-        for i in range(K):
-            for j in range(i + 1, K):
-                cos_ij = (lk_n[i] * lk_n[j]).sum()          # scalar ∈ [−1, 1]
-                pairs.append(cos_ij)
-        return torch.stack(pairs).mean()   # minimise → maximise angular diversity
+        M   = self.num_sensors
+        D   = self.obs_dim
+        H   = self.hidden_dim
+        mp  = self.modal_per
+        T_h = self.history_length
+        B   = batch_size
+
+        # ---- derived dims ------------------------------------------------
+        modal_flat_dim = M * mp
+        hist_in        = T_h * M
+        policy_in      = H + H // 2 + modal_flat_dim
+
+        rows: Dict[str, Dict] = {}
+
+        # ---- modal_encoder  [B, M, D] → [B, M, mp] ----------------------
+        #   Applied M times (once per sensor), shared weights
+        lin_me_macs = D * mp * M          # M parallel Linear(D, mp)
+        lin_me_p    = D * mp + mp         # weight + bias
+        gelu_me     = M * mp              # elementwise
+        rows["modal_encoder.linear"] = {
+            "shape": f"Linear({D}→{mp}) ×{M}",
+            "params": lin_me_p,
+            "macs":   lin_me_macs * B,
+        }
+        rows["modal_encoder.gelu"] = {
+            "shape": f"GELU ×{M*mp}",
+            "params": 0,
+            "macs":   gelu_me * B,
+        }
+
+        # ---- belief_gru  GRUCell(modal_flat_dim, H) ----------------------
+        #   3*(input*hidden + hidden*hidden)
+        gru_i = modal_flat_dim
+        gru_macs = 3 * H * (gru_i + H)
+        gru_p    = (
+            3 * (gru_i * H + H)   # W_i{r,z,n} + b_i{r,z,n}
+          + 3 * (H    * H + H)    # W_h{r,z,n} + b_h{r,z,n}
+        )
+        rows["belief_gru"] = {
+            "shape": f"GRUCell({gru_i}→{H})",
+            "params": gru_p,
+            "macs":   gru_macs * B,
+        }
+
+        # ---- history_encoder ---------------------------------------------
+        h0, h1 = hist_in, H // 2
+        rows["history_encoder.linear0"] = {
+            "shape": f"Linear({h0}→{h1})",
+            "params": h0 * h1 + h1,
+            "macs":   h0 * h1 * B,
+        }
+        rows["history_encoder.gelu"] = {
+            "shape": f"GELU ×{h1}",
+            "params": 0,
+            "macs":   h1 * B,
+        }
+        rows["history_encoder.linear1"] = {
+            "shape": f"Linear({h1}→{h1})",
+            "params": h1 * h1 + h1,
+            "macs":   h1 * h1 * B,
+        }
+        rows["history_encoder.layernorm"] = {
+            "shape": f"LayerNorm({h1})",
+            "params": 2 * h1,          # weight + bias (affine)
+            "macs":   2 * h1 * B,
+        }
+
+        # ---- policy_head  MLP(policy_in → H → H/2 → M) ------------------
+        p0, p1, p2 = policy_in, H, H // 2
+        rows["policy_head.linear0"] = {
+            "shape": f"Linear({p0}→{p1})",
+            "params": p0 * p1 + p1,
+            "macs":   p0 * p1 * B,
+        }
+        rows["policy_head.gelu0"] = {
+            "shape": f"GELU ×{p1}",
+            "params": 0,
+            "macs":   p1 * B,
+        }
+        rows["policy_head.linear1"] = {
+            "shape": f"Linear({p1}→{p2})",
+            "params": p1 * p2 + p2,
+            "macs":   p1 * p2 * B,
+        }
+        rows["policy_head.gelu1"] = {
+            "shape": f"GELU ×{p2}",
+            "params": 0,
+            "macs":   p2 * B,
+        }
+        rows["policy_head.linear2"] = {
+            "shape": f"Linear({p2}→{M})",
+            "params": p2 * M + M,
+            "macs":   p2 * M * B,
+        }
+
+        # ---- Gumbel-sigmoid  (training only) -----------------------------
+        rows["gumbel_sigmoid"] = {
+            "shape": f"sigmoid+noise ×{M}",
+            "params": 0,
+            "macs":   M * B,
+        }
+
+        # ---- totals -------------------------------------------------------
+        total_params = sum(r["params"] for r in rows.values())
+        total_macs   = sum(r["macs"]   for r in rows.values())
+
+        # ---- verify against actual param count ----------------------------
+        actual_params = sum(p.numel() for p in self.parameters())
+
+        # ---- pretty print -------------------------------------------------
+        W = 34
+        print(f"\n{'─'*78}")
+        print(f"  BeliefStatePOMDPAgent  profile  "
+              f"(M={M}, D={D}, H={H}, mp={mp}, T_h={T_h}, B={batch_size})")
+        print(f"{'─'*78}")
+        hdr = f"  {'Layer':<{W}}  {'Shape':<28}  {'Params':>9}  {'MACs':>12}"
+        print(hdr)
+        print(f"{'─'*78}")
+        for name, r in rows.items():
+            p_str  = f"{r['params']:,}"  if r['params'] else "—"
+            m_str  = f"{r['macs']:,}"    if r['macs']   else "—"
+            print(f"  {name:<{W}}  {r['shape']:<28}  {p_str:>9}  {m_str:>12}")
+        print(f"{'─'*78}")
+        print(f"  {'TOTAL (analytical)':<{W}}  {'':28}  "
+              f"{total_params:>9,}  {total_macs:>12,}")
+        print(f"  {'TOTAL (torch.parameters)':<{W}}  {'':28}  "
+              f"{actual_params:>9,}")
+        print(f"{'─'*78}")
+        print(f"  GFLOPs (×2 for FLOPs) = {total_macs * 2 / 1e9:.4f} G  "
+              f"per forward call (batch={batch_size})\n")
+
+        rows["__total__"] = {"params": total_params, "macs": total_macs}
+        return rows
 
     # ------------------------------------------------------------------
     # Belief state initialisation
@@ -591,14 +616,14 @@ class BeliefStatePOMDPAgent(nn.Module):
         hist_enc  = self.history_encoder(hist_flat) # [B, H/2]
 
         # ---- 4. Gate logits (with optional uncertainty) ----------------------
-        # Concatenate: belief (temporal context) + hist_enc + modal_flat (current modality identity)
-        combined = torch.cat([new_belief, hist_enc, modal_flat], dim=-1)  # [B, H + H/2 + M*modal_per]
-
-        # _compute_logits_and_uncertainty handles all three modes:
-        #   "none"       → (logits [B,M], None)
-        #   "ensemble"   → (mean logits [B,M], std [B,M])   — also caches _last_logits_k
-        #   "mc_dropout" → (mean logits [B,M], std [B,M])
-        gate_logits, uncertainty = self._compute_logits_and_uncertainty(combined)  # [B,M], [B,M]|None
+        # _compute_logits_and_uncertainty handles both modes:
+        #   "none"       → shared head on combined [B,H+H/2+M*mp]  → (logits [B,M], None)
+        #   "mc_dropout" → M per-sensor heads, K passes each       → (mean [B,M], std [B,M])
+        gate_logits, uncertainty = self._compute_logits_and_uncertainty(
+            new_belief, hist_enc, modal_flat
+        )  # [B,M], [B,M]|None
+        # combined is built here for AgentOutput (inspection / visualiser use only)
+        combined = torch.cat([new_belief, hist_enc, modal_flat], dim=-1)
 
         # ---- 5. Gumbel-Sigmoid policy (adaptive τ when uncertainty != None) --
         # When uncertainty is provided, τ_eff[b,m] = τ · (1 + scale · σ[b,m])
@@ -630,68 +655,6 @@ class BeliefStatePOMDPAgent(nn.Module):
             uncertainty   = uncertainty,   # [B, M] or None
         )
 
-    # ------------------------------------------------------------------
-    # Policy gradient helpers
-    # ------------------------------------------------------------------
-
-    def policy_gradient_loss(
-        self,
-        gate_logits: torch.Tensor,    # [B, M]  logits at decision step
-        gates_taken: torch.Tensor,    # [B, M]  hard gates that were executed
-        reward: torch.Tensor,         # [B]     per-sample reward
-        baseline: torch.Tensor,       # [B, 1]  value estimate (from value_head)
-        entropy_coeff: float = 0.01,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        REINFORCE with baseline + entropy bonus.
-
-        Loss = −E[ (R − V) · log π(a|b) ] − β · H[π]
-
-        where H[π] = −Σ_k p_k log p_k + (1-p_k) log(1-p_k)  is the Bernoulli
-        entropy summed over sensors, encouraging exploration.
-
-        Args
-        ----
-        gate_logits : logits used when the decision was made
-        gates_taken : the (hard) gates that were actually applied
-        reward      : scalar reward per sample (higher is better)
-        baseline    : value prediction (used to reduce variance)
-        entropy_coeff: weight for entropy regularisation
-
-        Returns
-        -------
-        pg_loss   : scalar tensor (backprop-ready)
-        info      : dict with component values for logging
-        """
-        p = torch.sigmoid(gate_logits)                # [B, M]
-        advantage = (reward - baseline.squeeze(-1)).detach()  # [B]  no grad through adv
-
-        # Bernoulli log-likelihood of gates_taken under policy π
-        log_prob = (
-            gates_taken * torch.log(p + self._eps)
-            + (1.0 - gates_taken) * torch.log(1.0 - p + self._eps)
-        ).sum(dim=-1)   # [B]
-
-        # REINFORCE loss (negative because we maximise reward)
-        pg_loss = -(advantage * log_prob).mean()
-
-        # Bernoulli entropy: H = -[p log p + (1-p) log(1-p)]
-        entropy = -(
-            p * torch.log(p + self._eps)
-            + (1.0 - p) * torch.log(1.0 - p + self._eps)
-        ).sum(dim=-1).mean()
-
-        total_loss = pg_loss - entropy_coeff * entropy
-
-        info = {
-            "pg_loss":   pg_loss.item(),
-            "entropy":   entropy.item(),
-            "advantage": advantage.mean().item(),
-        }
-        return total_loss, info
-
-    # value_loss removed along with value_head.
-
 
 # ---------------------------------------------------------------------------
 # Smoke test
@@ -702,11 +665,12 @@ if __name__ == "__main__":
     print("Smoke test: BeliefStatePOMDPAgent")
     print("=" * 65)
 
-    B, M, D, L, H = 4, 14, 32, 14, 128
+    B, M, D, L, H = 4, 12, 512, 20, 256
     agent = BeliefStatePOMDPAgent(
         num_sensors=M, obs_dim=D, hidden_dim=H,
         history_length=5, tau=1.0,
     )
+    agent.profile(batch_size=1)
     agent.train()
 
     obs     = torch.randn(B, L, D)
@@ -726,12 +690,6 @@ if __name__ == "__main__":
         if p.grad is None:
             print(f"  WARNING: {name} has no grad")
     print("✓ All parameters have gradients.")
-
-    # Lagrangian test
-    ctrl = LagrangianSparsityController(target_sparsity=0.4)
-    for _ in range(20):
-        mu = ctrl.update(0.6)   # simulate high activity → violation
-    print(f"Lagrangian μ after 20 steps of violation: {ctrl.current_mu:.4f}")
 
     # Regret tracker test
     tracker = RegretTracker()

@@ -10,6 +10,9 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import ListedColormap, BoundaryNorm
 
+from visualization.style import apply_neurips_style, DOUBLE_COL, PALETTE
+apply_neurips_style()
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 DATA_ROOT = "/Users/chengweizhou/PycharmProjects/data/MHEALTHDATASET"
 SUBJECT_ID = 1
@@ -77,13 +80,13 @@ act_colors = {a: cmap_acts(i) for i, a in enumerate(all_acts)}
 
 # ─── Build figure ─────────────────────────────────────────────────────────────
 n_modalities = len(MODALITIES)
-fig_height   = 3.5 * n_modalities + 1.5   # extra space for legend
+fig_height   = 2.2 * n_modalities + 1.5
 fig, axes = plt.subplots(n_modalities, 1,
-                         figsize=(22, fig_height),
+                         figsize=(DOUBLE_COL * 1.4, fig_height),
                          sharex=True,
-                         gridspec_kw={"hspace": 0.45})
+                         gridspec_kw={"hspace": 0.55})
 
-channel_colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]   # up to 3 lines per panel
+channel_colors = ["#0173B2", "#DE8F05", "#029E73"]   # up to 3 lines per panel
 
 for ax, (modal_name, channels, unit) in zip(axes, MODALITIES):
     # ── Background shading per activity segment ──
@@ -107,14 +110,12 @@ for ax, (modal_name, channels, unit) in zip(axes, MODALITIES):
         ax.axvline(x=time_axis[b], color="black", linewidth=0.8,
                    linestyle="--", alpha=0.5)
 
-    ax.set_ylabel(f"{modal_name}\n({unit})", fontsize=9)
-    ax.legend(loc="upper right", fontsize=7, framealpha=0.6)
-    ax.tick_params(labelsize=8)
-    ax.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.5)
+    ax.set_ylabel(f"{modal_name}\n({unit})")
+    ax.legend(loc="upper right", ncol=1)
+    ax.grid(axis="y")
 
-axes[-1].set_xlabel("Time (s)", fontsize=10)
-fig.suptitle(f"mHEALTH Dataset – Subject {SUBJECT_ID} (null segments removed)",
-             fontsize=13, fontweight="bold", y=0.995)
+axes[-1].set_xlabel("Time (s)")
+fig.suptitle(f"mHEALTH Dataset — Subject {SUBJECT_ID} (null segments removed)", y=0.995)
 
 # ── Activity name labels on the top panel ──
 ax_top = axes[0]
@@ -125,8 +126,7 @@ for s, e in zip(seg_starts, seg_ends):
     mid_t = (time_axis[s] + time_axis[e - 1]) / 2
     ax_top.text(mid_t, ax_top.get_ylim()[1],
                 ACTIVITY_NAMES.get(act, str(act)),
-                ha="center", va="bottom", fontsize=7,
-                color="black", rotation=0,
+                ha="center", va="bottom", color="black",
                 bbox=dict(facecolor=act_colors[act], alpha=0.5,
                           boxstyle="round,pad=0.2", edgecolor="none"))
 
@@ -138,16 +138,13 @@ patches = [mpatches.Patch(color=act_colors[a], alpha=0.6,
 fig.legend(handles=patches,
            loc="lower center",
            ncol=min(len(present_acts), 7),
-           fontsize=8,
            title="Activity",
-           title_fontsize=9,
-           bbox_to_anchor=(0.5, 0.0),
-           framealpha=0.8)
+           bbox_to_anchor=(0.5, 0.0))
 
 plt.tight_layout(rect=[0, 0.05, 1, 1])
 
 # ─── Save & show ──────────────────────────────────────────────────────────────
 os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
-fig.savefig(SAVE_PATH, dpi=150, bbox_inches="tight")
+fig.savefig(SAVE_PATH)
 print(f"Saved to {SAVE_PATH}")
 plt.show()

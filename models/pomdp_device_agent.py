@@ -19,13 +19,11 @@ duplicating architecture code.
 from models.pomdp_sensor_agent import (  # noqa: F401
     AgentOutput,
     BeliefStatePOMDPAgent as BeliefStatePOMDPDeviceAgent,
-    LagrangianSparsityController,
     RegretTracker,
 )
 
 __all__ = [
     "BeliefStatePOMDPDeviceAgent",
     "AgentOutput",
-    "LagrangianSparsityController",
     "RegretTracker",
 ]

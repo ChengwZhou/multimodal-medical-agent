@@ -149,12 +149,8 @@ class SigmaDeltaJointTrainer:
         mem_cache_len: int = 10,        # rolling-mean cache length
         channels_per_device: Optional[List[int]] = None,  # device-wise gate expansion
         only_predictive: bool = False,  # run agent but don't apply gate mask to input
-        # Ratio constraint (ablation-friendly)
-        target_agent_ratio: Optional[float] = None,   # None = use L1 penalty instead
         # Predictive auxiliary loss
         predictive_lr: float = 1e-3,   # separate LR for predictive MLP
-        # Ensemble diversity loss (only active when agent uses uncertainty_type='ensemble')
-        agent_diversity_weight: float = 0.0,   # 0 = disabled; e.g. 0.01 prevents head collapse
         # DDP
         ddp_rank: Optional[int] = None,
         ddp_world_size: Optional[int] = None,
@@ -274,12 +270,14 @@ class SigmaDeltaJointTrainer:
         # None means sensor-wise (uniform channels per sensor).
         self.channels_per_device   = channels_per_device
         self.only_predictive       = only_predictive
-        self.target_agent_ratio    = target_agent_ratio
-        self.agent_diversity_weight = agent_diversity_weight
         self.save_dir              = save_dir
 
         # ---- Criterion --------------------------------------------------------
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
+
+        # ---- Visualizer (optional) --------------------------------------------
+        self.visualizer   = None   # set via attach_visualizer()
+        self.viz_interval = 50     # steps between gate snapshots
 
         # ---- State ------------------------------------------------------------
         self.epoch        = 0
@@ -314,6 +312,11 @@ class SigmaDeltaJointTrainer:
         if self.predictive_mlp is None:
             return None
         return self.predictive_mlp.module if self.is_ddp else self.predictive_mlp
+
+    def attach_visualizer(self, visualizer, viz_interval: int = 50):
+        """Attach a PomdpVisualizer.  Call before trainer.train()."""
+        self.visualizer   = visualizer
+        self.viz_interval = viz_interval
 
     # ==========================================================================
     # Core training step  (one BPTT chunk of `bptt_steps` windows)
@@ -423,16 +426,29 @@ class SigmaDeltaJointTrainer:
                         metrics["mean_tau"] += tau_eff.mean().item()
                         metrics["mean_uncertainty"] += agent_out.uncertainty.mean().item()
                     else:
+                        tau_eff = None
                         metrics["mean_tau"] += tau_base.item()
+
+                # ---- Visualizer gate snapshot ----------------------------
+                if self.visualizer is not None and self.is_main:
+                    if self.global_step % self.viz_interval == 0:
+                        with torch.no_grad():
+                            snap = {
+                                "gate_logits": agent_out.gate_logits.mean(0).cpu().numpy(),
+                                "p_soft":      agent_p_soft.mean(0).cpu().numpy(),
+                                "uncertainty": (agent_out.uncertainty.mean(0).cpu().numpy()
+                                                if agent_out.uncertainty is not None else None),
+                                "tau_eff":     (tau_eff.mean(0).cpu().numpy()
+                                                if tau_eff is not None else None),
+                            }
+                        self.visualizer.log_step(self.global_step, snap)
             else:
                 agent_p_soft = None
                 current_belief_for_pred = None
                 window_gated = window   # no gating yet (cold start / first window of chunk)
 
             # ---- Model forward -----------------------------------------------
-            context = None
-            if mem_cache:
-                context = torch.stack(mem_cache).mean(0)
+            context = torch.stack(mem_cache).mean(0) if (mem_cache and i > start) else None
 
             with autocast(enabled=self.use_amp):
                 out = self.model(window_gated, history=context)
@@ -495,36 +511,20 @@ class SigmaDeltaJointTrainer:
                     metrics["active_ratio"] += ar.item()
 
                 # Sparsity penalty on agent gate
+                # Skipped in only_predictive mode: sparsity loss flows through
+                # agent → model memory → model params, polluting model training.
+                # only_predictive intent is "agent learns without affecting model".
                 window_loss = self.ce_weight * ce
-                if agent_p_soft is not None:
+                if (agent_p_soft is not None
+                        and self.agent_sparsity_weight > 0
+                        and not self.only_predictive):
                     cur_ratio = agent_p_soft.mean()
-                    if self.target_agent_ratio is not None:
-                        # Squared-error constraint: pushes ratio toward target from both sides.
-                        # Gradient: 2·w·(ratio - target)/M  →  negative when ratio>target (pushes down),
-                        #           positive when ratio<target (pushes up).
-                        # More reliable than Lagrangian because it acts immediately every step.
-                        ratio_penalty = self.agent_sparsity_weight * (cur_ratio - self.target_agent_ratio).pow(2)
-                        window_loss = window_loss + ratio_penalty
-                        metrics["sparsity_loss"] += ratio_penalty.item()
-                    elif self.agent_sparsity_weight > 0:
-                        # Original fixed L1 penalty (one-sided, only pushes ratio down)
-                        window_loss = window_loss + self.agent_sparsity_weight * cur_ratio
-                        metrics["sparsity_loss"] += cur_ratio.item()
+                    window_loss = window_loss + self.agent_sparsity_weight * cur_ratio
+                    metrics["sparsity_loss"] += cur_ratio.item()
 
                 # Add predictive auxiliary loss to window_loss
                 if pred_loss is not None:
                     window_loss = window_loss + self.predictive_weight * pred_loss
-
-                # Ensemble diversity loss: only when agent was actually called this
-                # window (agent_p_soft is not None).  Must NOT run when i == start
-                # (agent skipped) because _last_logits_k would still hold the freed
-                # graph from the previous chunk → "backward through freed graph" error.
-                if self.agent_diversity_weight > 0 and agent_p_soft is not None:
-                    div_loss = self._agent.ensemble_diversity_loss()
-                    if div_loss is not None:
-                        window_loss = window_loss + self.agent_diversity_weight * div_loss
-                        # diversity metric: 1 - cosine_sim ∈ [0, 2]; higher = more diverse heads
-                        metrics["ensemble_diversity"] += (1.0 - div_loss.item())
 
                 # Accumulate into chunk loss — single backward at end of chunk
                 chunk_loss = window_loss if chunk_loss is None else chunk_loss + window_loss
@@ -540,7 +540,7 @@ class SigmaDeltaJointTrainer:
             # actually received scaled gradients during backward.
             # We check dynamically after backward because:
             #   - bptt_steps=1  → agent never called (i > start always False)
-            #   - only_predictive=True + agent_sparsity_weight=0 → agent called
+            #   - only_predictive=True → agent called
             #     but gate not applied to loss, so agent params have no grads
             self.scaler.unscale_(self.model_opt)
             if self.grad_clip > 0:
@@ -642,11 +642,12 @@ class SigmaDeltaJointTrainer:
                     epoch_metrics[k].append(v)
 
                 self.global_step += 1
+                self._agent.anneal_step()   # no-op unless uncertainty_type=="none_annealing"
 
             if self.is_main and batch_idx % self.log_interval == 0:
                 _tau_val  = np.mean(epoch_metrics.get("mean_tau",        [self._agent.get_temperature().item()]))
                 _unc_val  = np.mean(epoch_metrics.get("mean_uncertainty", [0.0]))
-                _unc_str  = f"  unc={_unc_val:.4f}" if self._agent.uncertainty_type != "none" else ""
+                _unc_str  = f"  unc={_unc_val:.4f}" if self._agent.uncertainty_type not in ("none", "none_annealing") else ""
                 _log(
                     f"  step {batch_idx:4d}  "
                     f"ce={np.mean(epoch_metrics.get('ce_loss', [0])):.4f}  "
@@ -828,7 +829,7 @@ class SigmaDeltaJointTrainer:
                 elapsed = time.time() - t0
                 _tau_e   = train_m.get("mean_tau", self._agent.get_temperature().item())
                 _unc_e   = train_m.get("mean_uncertainty", 0.0)
-                _unc_es  = f"  unc={_unc_e:.4f}" if self._agent.uncertainty_type != "none" else ""
+                _unc_es  = f"  unc={_unc_e:.4f}" if self._agent.uncertainty_type not in ("none", "none_annealing") else ""
                 _log(
                     f"Epoch {epoch:3d}  "
                     f"loss={train_m.get('ce_loss', 0):.4f}  "
@@ -856,8 +857,78 @@ class SigmaDeltaJointTrainer:
                 with open(os.path.join(self.save_dir, "skip_patterns.json"), "w") as f:
                     json.dump(self._skip_history, f, indent=2, default=str)
 
+                # ---- Visualizer epoch log -----------------------------------
+                if self.visualizer is not None:
+                    self.visualizer.log_epoch(epoch, train_m, val_m)
+
+        # ---- Visualizer: collect one val sequence gate timeline then plot ----
+        if self.visualizer is not None and self.is_main:
+            self._viz_collect_val_sequence()
+            self.visualizer.save_logs()
+            self.visualizer.generate_plots()
+
         _log("Training complete.")
         _log(f"Best val_accuracy : {self.best_val_acc:.4f}")
+
+    # ==========================================================================
+    # Visualizer helper — collect one validation sequence gate timeline
+    # ==========================================================================
+
+    @torch.no_grad()
+    def _viz_collect_val_sequence(self):
+        """Run one validation batch and record gate decisions over time for Plot 6."""
+        if self.val_loader is None or self.visualizer is None:
+            return
+        self.model.eval()
+        self.agent.eval()
+
+        batch = next(iter(self.val_loader))
+        if hasattr(batch, "sequences"):
+            sequences = batch.sequences.to(self.device)
+            labels    = batch.labels.to(self.device)
+            max_seq   = sequences.shape[1]
+        else:
+            xb, yb    = batch
+            sequences = xb.to(self.device).unsqueeze(1)
+            labels    = yb.to(self.device).unsqueeze(1)
+            max_seq   = 1
+
+        B = sequences.shape[0]
+        mem         = None
+        mem_cache:  List[torch.Tensor] = []
+        belief      = self._agent.init_belief(B, self.device)
+        sensor_hist = self._agent.init_sensor_history(B, self.device)
+
+        gate_timeline = []
+        label_timeline = []
+
+        for i in range(max_seq):
+            window = sequences[:, i, :, :]
+            label  = labels[:, i]
+            label_timeline.append(label[0].item())
+
+            if mem is not None:
+                agent_out = self.agent(mem, belief, sensor_hist, use_straight_through=False)
+                belief      = agent_out.belief
+                sensor_hist = torch.cat(
+                    [sensor_hist[:, 1:, :], agent_out.p_hard.unsqueeze(1)], dim=1
+                )
+                gate_timeline.append(agent_out.p_hard[0].cpu().numpy())  # first sample in batch
+            else:
+                gate_timeline.append(np.ones(self._agent.num_sensors))
+
+            context = torch.stack(mem_cache).mean(0) if mem_cache else None
+            out = self.model(window, history=context)
+            mem_new = out[1] if isinstance(out, tuple) else None
+            if mem_new is not None:
+                mem_cache.append(mem_new.detach())
+                if len(mem_cache) > self.mem_cache_len:
+                    mem_cache.pop(0)
+            mem = mem_new
+
+        gates_np  = np.stack(gate_timeline, axis=0)        # [T, M]
+        labels_np = np.array(label_timeline, dtype=np.int64)  # [T]
+        self.visualizer.log_val_sequence(self.epoch, gates_np, labels_np)
 
     # ==========================================================================
     # Checkpoint
@@ -922,13 +993,7 @@ def _parse_args():
     # Loss weights
     p.add_argument("--ce_weight",             type=float, default=1.0)
     p.add_argument("--agent_sparsity_weight", type=float, default=0.0,
-                   help="L1 penalty on agent p_soft.mean(). Increase to reduce agent_ratio. "
-                        "Ignored when --target_agent_ratio is set.")
-    p.add_argument("--target_agent_ratio",   type=float, default=None,
-                   help="Target agent_ratio for squared-error constraint. "
-                        "When set, loss += agent_sparsity_weight * (p_soft.mean() - target)^2. "
-                        "Pushes ratio toward target from both directions. "
-                        "Use agent_sparsity_weight to control how tightly the target is enforced.")
+                   help="L1 penalty on agent p_soft.mean(). Increase to reduce agent_ratio.")
     p.add_argument("--predictive_weight",    type=float, default=0.0,
                    help="Weight for predictive auxiliary loss (belief → next model memory). "
                         "0 (default) = disabled. E.g. 0.1 trains GRU to be predictive of "
@@ -964,28 +1029,36 @@ def _parse_args():
     p.add_argument("--use_device_wise_model", action="store_true",
                    help="Use former_device.py backbone with device-level POMDP gating instead of "
                         "sigma_former_sensor.py with sensor-level gating.")
+    p.add_argument("--device_gate_granularity", default="modality",
+                   choices=["modality", "channel"],
+                   help="Granularity of the POMDP gate when --use_device_wise_model is set.\n"
+                        "  modality — one gate per modality entry in the modalities list (default)\n"
+                        "  channel  — one gate per individual input channel (original behaviour)")
     # Uncertainty-aware exploration (addresses Thompson Sampling approximation gap)
     p.add_argument("--agent_uncertainty", default="none",
-                   choices=["none", "ensemble", "mc_dropout"],
-                   help="Uncertainty estimation mode for the POMDP agent.\n"
-                        "  none       — original fixed-variance Gumbel exploration (default)\n"
-                        "  ensemble   — K independent policy heads; std of their logits = epistemic "
-                                       "uncertainty; high-uncertainty sensors explore more (adaptive τ)\n"
-                        "  mc_dropout — single head with AlwaysDropout; K stochastic MC passes; "
-                                       "variance = uncertainty; works at both train and eval")
-    p.add_argument("--agent_ensemble_k", type=int, default=5,
-                   help="K = number of ensemble heads (ensemble) or MC passes (mc_dropout). "
-                        "Higher K → better uncertainty estimate, more compute. Default 5.")
+                   choices=["none", "logit", "none_annealing"],
+                   help="Uncertainty / exploration mode for the POMDP agent.\n"
+                        "  none           — fixed-variance Gumbel with constant τ (default)\n"
+                        "  logit          — uncertainty = H(p)/log2 ∈ [0,1]; τ_eff per sensor\n"
+                        "  none_annealing — no uncertainty; τ decays τ_max→τ_min over\n"
+                        "                   --tau_anneal_steps training steps (exponential)")
     p.add_argument("--agent_uncertainty_scale", type=float, default=1.0,
-                   help="Scale for adaptive temperature widening: "
-                        "τ_eff[m] = τ · (1 + scale · σ[m]). "
-                        "0 = uncertainty computed but exploration not widened. Default 1.0.")
-    p.add_argument("--agent_diversity_weight", type=float, default=0.0,
-                   help="Weight for ensemble diversity regularisation loss "
-                        "(only active when --agent_uncertainty=ensemble). "
-                        "Prevents all K heads from collapsing to identical weights, "
-                        "which would degenerate uncertainty estimates to ~0. "
-                        "Suggested range: 0.001–0.05. Default 0 (disabled).")
+                   help="Scale for adaptive temperature widening (logit mode only): "
+                        "τ_eff[m] = τ · (1 + scale · σ[m]). Default 1.0.")
+    p.add_argument("--tau_min", type=float, default=0.6,
+                   help="Minimum τ reached at the end of annealing (none_annealing mode). "
+                        "Default 0.1.")
+    p.add_argument("--tau_anneal_steps", type=int, default=5000,
+                   help="Number of training steps over which τ decays from --agent_tau to "
+                        "--tau_min (exponential schedule). Default 5000.")
+    # Visualization
+    p.add_argument("--visualize", action="store_true",
+                   help="Enable POMDP training visualizer. Saves plots to --viz_dir after training.")
+    p.add_argument("--viz_dir", type=str, default=None,
+                   help="Directory for visualizer logs and plots. "
+                        "Defaults to <save_dir>/viz.")
+    p.add_argument("--viz_interval", type=int, default=50,
+                   help="Log a gate snapshot every N training steps. Default 50.")
     return p.parse_args()
 
 
@@ -1045,7 +1118,6 @@ if __name__ == "__main__":
             ds = MHealthDataset(args.root, subjects=list(range(1, 11)),
                                 time_steps=50, step=25, balance=False)
             modalities = [ModalityConfig(f"m{i}", 1, 10) for i in range(13)]
-
         # Apply DeltaDataset when sigma-delta sensing is active
         if apply_delta:
             ds = DeltaDataset(ds, axis=-1)
@@ -1149,11 +1221,12 @@ if __name__ == "__main__":
             modal_fusion      = args.modal_fusion,
         )
         agent_cls               = BeliefStatePOMDPDeviceAgent
-        # Use channel-level gating (aligned with agent_trainer.py: 12 gates not 2).
-        # Device-level gating (num_devices=2) is too aggressive — one gate closure
-        # kills 6/12 channels, causing instability.
-        agent_num_sensors       = num_modal
-        trainer_cpd             = None
+        if args.device_gate_granularity == "modality":
+            agent_num_sensors   = len(modalities)                   # one gate per modality
+            trainer_cpd         = [m.in_ch for m in modalities]     # expand modality gate → channels
+        else:  # "channel"
+            agent_num_sensors   = sum(m.in_ch for m in modalities)  # one gate per channel
+            trainer_cpd         = None
 
     elif use_sigma and not use_device:
         # sigma_former_sensor: sigma-delta sensing, sensor-wise tokenisation
@@ -1184,9 +1257,12 @@ if __name__ == "__main__":
             modal_fusion = args.modal_fusion,
         )
         agent_cls               = BeliefStatePOMDPDeviceAgent
-        # Use channel-level gating (aligned with agent_trainer.py: 12 gates not 2).
-        agent_num_sensors       = num_modal
-        trainer_cpd             = None
+        if args.device_gate_granularity == "modality":
+            agent_num_sensors   = len(modalities)
+            trainer_cpd         = [m.in_ch for m in modalities]
+        else:  # "channel"
+            agent_num_sensors   = sum(m.in_ch for m in modalities)
+            trainer_cpd         = None
 
     else:
         # former_sensor: no sigma-delta, sensor-wise tokenisation
@@ -1215,17 +1291,24 @@ if __name__ == "__main__":
         history_length    = args.history_length,
         tau               = args.agent_tau,
         modal_per         = args.agent_modal_per,
-        uncertainty_type  = args.agent_uncertainty,
-        ensemble_k        = args.agent_ensemble_k,
-        uncertainty_scale = args.agent_uncertainty_scale,
+        uncertainty_type   = args.agent_uncertainty,
+        uncertainty_scale  = args.agent_uncertainty_scale,
+        tau_min            = args.tau_min,
+        tau_anneal_steps   = args.tau_anneal_steps,
     )
 
     if args.agent_uncertainty != "none":
-        logging.info(
-            f"Agent uncertainty: type={args.agent_uncertainty}  "
-            f"K={args.agent_ensemble_k}  scale={args.agent_uncertainty_scale}  "
-            f"diversity_weight={args.agent_diversity_weight}"
-        )
+        if args.agent_uncertainty == "none_annealing":
+            logging.info(
+                f"Agent uncertainty: τ annealing  "
+                f"τ_max={args.agent_tau}  τ_min={args.tau_min}  "
+                f"steps={args.tau_anneal_steps}"
+            )
+        else:
+            logging.info(
+                f"Agent uncertainty: type={args.agent_uncertainty}  "
+                f"scale={args.agent_uncertainty_scale}"
+            )
 
     # ---- Build trainer and run ---------------------------------------------
     trainer = SigmaDeltaJointTrainer(
@@ -1241,15 +1324,42 @@ if __name__ == "__main__":
         agent_sparsity_weight  = args.agent_sparsity_weight,
         predictive_weight      = args.predictive_weight,
         predictive_lr          = args.predictive_lr,
-        agent_diversity_weight = args.agent_diversity_weight,
         save_dir               = args.save_dir,
         use_memory             = not args.no_memory,
         channels_per_device    = trainer_cpd,
         only_predictive        = args.only_predictive,
-        target_agent_ratio     = args.target_agent_ratio,
         ddp_rank               = local_rank    if is_distributed else None,
         ddp_world_size         = world_size    if is_distributed else None,
     )
+
+    # ---- Attach visualizer (rank 0 only) ------------------------------------
+    if args.visualize and (not is_distributed or local_rank == 0):
+        from visualization.pomdp_viz import PomdpVisualizer
+        viz_dir = args.viz_dir or os.path.join(args.save_dir, "viz")
+        if use_device:
+            if args.device_gate_granularity == "modality":
+                gate_names = [m.name for m in modalities]           # ["al", "gl", "ar", "gr"]
+                gate_label = "Modality"
+            else:  # "channel"
+                gate_names = [
+                    f"{m.name}_{c}"
+                    for m in modalities
+                    for c in range(m.in_ch)
+                ]                                                    # ["al_0","al_1","al_2","gl_0",...]
+                gate_label = "Channel"
+        else:
+            gate_names = [m.name for m in modalities] if modalities else None
+            gate_label = "Sensor"
+        visualizer = PomdpVisualizer(
+            viz_dir          = viz_dir,
+            num_sensors      = agent_num_sensors,
+            sensor_names     = gate_names,
+            gate_label       = gate_label,
+            uncertainty_mode = args.agent_uncertainty,
+        )
+        trainer.attach_visualizer(visualizer, viz_interval=args.viz_interval)
+        logging.info(f"PomdpVisualizer attached → {viz_dir}  (interval={args.viz_interval} steps)")
+
     trainer.train()
 
     if is_distributed:

@@ -5,6 +5,9 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from visualization.style import apply_neurips_style, DOUBLE_COL
+apply_neurips_style()
+sns.set_theme(style="ticks", rc={"axes.grid": True, "grid.linestyle": "--", "grid.alpha": 0.35})
 import os
 import sys
 
@@ -173,21 +176,22 @@ activation_rate = active_sum / total_instances          # [12, 100]， ∈ [0,1]
 
 np.save("hmc_activation_rate.npy", activation_rate)
 
-plt.figure(figsize=(20, 10))
+fig, ax = plt.subplots(figsize=(DOUBLE_COL * 1.3, 4.0))
 sns.heatmap(
     activation_rate,
-    cmap="viridis",
+    ax=ax,
+    cmap="RdYlBu_r",
     annot=False,
-    cbar_kws={"label": "Activation Rate (higher = less skipped)"},
+    cbar_kws={"label": "Activation Rate", "shrink": 0.8},
     xticklabels=10,
-    yticklabels=[f"Sensor {i}" for i in range(12)]
+    yticklabels=[f"Sensor {i}" for i in range(8)],
+    linewidths=0,
 )
-plt.xlabel("Time Step (0–99)")
-plt.ylabel("Sensor Index (0–11)")
-plt.title("Fine-Grained Sensor Skipping Heatmap (12 sensors × 100 timesteps)\n"
-          "Device-Level Gating + Per-Sensor Sigma-Delta (MHealth Val Set)")
+ax.set_xlabel("Time Step")
+ax.set_ylabel("Sensor")
+ax.set_title("Per-Sensor Activation Rate — Sensor-Level Gating (HMC Val Set)")
 plt.tight_layout()
-plt.savefig("mhealth_fine_grained_12x100_sensor_skipping_heatmap.png", dpi=400, bbox_inches='tight')
+plt.savefig("mhealth_fine_grained_12x100_sensor_skipping_heatmap.png")
 plt.show()
 
 print("\n=== Average activation rate per sensor (lower = more aggressively skipped) ===")

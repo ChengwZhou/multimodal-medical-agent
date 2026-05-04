@@ -10,6 +10,9 @@ import matplotlib.patches as mpatches
 import pyedflib
 from scipy import signal as scipy_signal
 
+from visualization.style import apply_neurips_style, DOUBLE_COL, PALETTE
+apply_neurips_style()
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 DATA_ROOT   = "/Users/chengweizhou/PycharmProjects/data/hmc"
 SUBJECT_ID  = "SN029"
@@ -26,7 +29,7 @@ STAGE_MAP = {
     "Sleep stage R":  4,
 }
 STAGE_NAMES  = {0: "Wake", 1: "N1", 2: "N2", 3: "N3", 4: "REM"}
-STAGE_COLORS = {0: "#e8e8e8", 1: "#aec6f5", 2: "#4e91e3", 3: "#1a3c8a", 4: "#f4a43c"}
+STAGE_COLORS = {0: "#d9d9d9", 1: "#9ecae1", 2: "#3182bd", 3: "#08306b", 4: "#DE8F05"}
 
 # ─── Channel groupings ────────────────────────────────────────────────────────
 # (panel_name, [channel_names], y_unit)
@@ -40,7 +43,7 @@ MODALITIES = [
     ("EOG / EMG",                    ["EMG chin", "EOG E1-M2", "EOG E2-M2"], "µV"),
     ("ECG",                          ["ECG"],                             "mV"),
 ]
-CHANNEL_LINE_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+CHANNEL_LINE_COLORS = ["#0173B2", "#DE8F05", "#029E73"]
 
 # ─── Load PSG (EDF) ───────────────────────────────────────────────────────────
 psg_path = os.path.join(DATA_ROOT, f"{SUBJECT_ID}.edf")
@@ -96,11 +99,11 @@ seg_ends    = np.concatenate([_boundaries, [n_plot]])
 
 # ─── Plot ─────────────────────────────────────────────────────────────────────
 n_panels   = len(MODALITIES)
-fig_height = 3.0 * n_panels + 2.0
+fig_height = 2.2 * n_panels + 1.5
 fig, axes  = plt.subplots(n_panels, 1,
-                           figsize=(22, fig_height),
+                           figsize=(DOUBLE_COL * 1.4, fig_height),
                            sharex=True,
-                           gridspec_kw={"hspace": 0.45})
+                           gridspec_kw={"hspace": 0.55})
 
 for ax, (panel_name, channels, unit) in zip(axes, MODALITIES):
     # Background shading per stage
@@ -121,12 +124,11 @@ for ax, (panel_name, channels, unit) in zip(axes, MODALITIES):
         ax.axvline(x=time_sec[b], color="black", linewidth=0.7,
                    linestyle="--", alpha=0.4)
 
-    ax.set_ylabel(f"{panel_name}\n({unit})", fontsize=9)
-    ax.legend(loc="upper right", fontsize=7, framealpha=0.6)
-    ax.tick_params(labelsize=8)
-    ax.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.5)
+    ax.set_ylabel(f"{panel_name}\n({unit})")
+    ax.legend(loc="upper right", ncol=1)
+    ax.grid(axis="y")
 
-axes[-1].set_xlabel("Time (min)", fontsize=10)
+axes[-1].set_xlabel("Time (min)")
 
 # ─── Activity annotations on top panel ───────────────────────────────────────
 ax_top  = axes[0]
@@ -138,12 +140,11 @@ for s, e in zip(seg_starts, seg_ends):
     mid_t = (time_sec[s] + time_sec[e - 1]) / 2
     ax_top.text(mid_t, ylim_top[1],
                 STAGE_NAMES[lbl],
-                ha="center", va="bottom", fontsize=7.5,
+                ha="center", va="bottom",
                 bbox=dict(facecolor=STAGE_COLORS[lbl], alpha=0.7,
                           boxstyle="round,pad=0.2", edgecolor="none"))
 
-fig.suptitle(f"HMC Sleep Dataset – {SUBJECT_ID}  (first {PLOT_MIN} min)",
-             fontsize=13, fontweight="bold", y=0.998)
+fig.suptitle(f"HMC Sleep Dataset — {SUBJECT_ID}  (first {PLOT_MIN} min)", y=0.998)
 
 # ─── Legend ───────────────────────────────────────────────────────────────────
 present_stages = sorted(set(stages[stages >= 0]))
@@ -152,12 +153,12 @@ patches = [mpatches.Patch(color=STAGE_COLORS[s], alpha=0.7,
            for s in present_stages]
 fig.legend(handles=patches,
            loc="lower center", ncol=len(present_stages),
-           fontsize=9, title="Sleep Stage", title_fontsize=10,
-           bbox_to_anchor=(0.5, 0.0), framealpha=0.8)
+           title="Sleep Stage",
+           bbox_to_anchor=(0.5, 0.0))
 
 plt.tight_layout(rect=[0, 0.04, 1, 1])
 
 os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
-fig.savefig(SAVE_PATH, dpi=150, bbox_inches="tight")
+fig.savefig(SAVE_PATH)
 print(f"Saved to {SAVE_PATH}")
 plt.show()

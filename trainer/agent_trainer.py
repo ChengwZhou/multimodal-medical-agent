@@ -16,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import get_rank, is_initialized
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR, SequentialLR
 import torch.distributed as dist
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.amp import autocast
 
 import numpy as np
@@ -158,8 +158,15 @@ class AgentSequentialTrainer:
 
         # Wrap with DDP if needed
         if self.is_ddp:
-            self.model = DDP(self.model, device_ids=[self.rank], find_unused_parameters=True)
-            self.agent = DDP(self.agent, device_ids=[self.rank], find_unused_parameters=True)
+            # find_unused_parameters=False: no unused params in our graph (verified by runtime warning).
+            # _set_static_graph(): required for BPTT — each BPTT chunk calls model.forward() multiple
+            # times before one backward(), which confuses DDP's per-iteration hook tracking.
+            # _set_static_graph() tells DDP the compute graph is static so it doesn't reset ready-state
+            # on every forward() call, allowing multiple forward+backward rounds per optimizer step.
+            self.model = DDP(self.model, device_ids=[self.rank], find_unused_parameters=False)
+            self.model._set_static_graph()
+            self.agent = DDP(self.agent, device_ids=[self.rank], find_unused_parameters=False)
+            self.agent._set_static_graph()
 
         # Setup optimizers
         self.model_optimizer = torch.optim.AdamW(
@@ -175,7 +182,7 @@ class AgentSequentialTrainer:
         )
 
         # Mixed precision scaler
-        self.scaler = GradScaler(enabled=self.use_amp)
+        self.scaler = GradScaler('cuda', enabled=self.use_amp)
 
         # Setup data loaders
         if train_loader is not None:
@@ -233,6 +240,11 @@ class AgentSequentialTrainer:
         self.step = 0
         self.epoch = 0
         self.best_val_acc = 0.0
+        self.global_step  = 0
+
+        # Visualizer (attached via attach_visualizer before train())
+        self.visualizer   = None
+        self.viz_interval = 50
 
         # Loss function
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
@@ -253,7 +265,8 @@ class AgentSequentialTrainer:
                 nn.Linear(model_dim * 2, model_dim)
             ).to(self.device)
             if self.is_ddp:
-                self.predictive_mlp = DDP(self.predictive_mlp, device_ids=[self.rank], find_unused_parameters=True)
+                self.predictive_mlp = DDP(self.predictive_mlp, device_ids=[self.rank], find_unused_parameters=False)
+                self.predictive_mlp._set_static_graph()
             self.predictive_optimizer = torch.optim.AdamW(
                 self.predictive_mlp.parameters(),
                 lr=learning_rate,
@@ -270,6 +283,11 @@ class AgentSequentialTrainer:
             log_info(f"Contrastive loss: {use_contrastive_loss}, weight: {contrastive_weight}, tau: {contrastive_tau}")
             log_info(
                 f"Predictive loss: {use_predictive_loss}, weight: {predictive_weight}, offset: {predictive_offset}")
+
+    def attach_visualizer(self, visualizer, viz_interval: int = 50):
+        """Attach a PomdpVisualizer for training visualization."""
+        self.visualizer   = visualizer
+        self.viz_interval = viz_interval
 
     def get_lr_schedulers(self, steps_per_epoch: int):
         """Get learning rate schedulers — no total_steps required.
@@ -416,7 +434,22 @@ class AgentSequentialTrainer:
         B, max_seq_len, C, T = sequences.shape
         print("sequences.shape:", sequences.shape)
 
-        # print(max_seq_len, self.device)
+        # DDP requires every rank to call backward() (and thus all-reduce) the exact same
+        # number of times.  Different recordings have different window counts, so each rank's
+        # batch may have a different max_seq_len → different num_chunks → deadlock.
+        # All-reduce to the global MAX so every rank uses identical num_chunks.
+        # Ranks with shorter sequences pad sequences with zeros and labels with -100
+        # (masked out in the loss), so extra chunks produce zero loss/gradient.
+        if self.is_ddp:
+            _len_t = torch.tensor(max_seq_len, device=self.device)
+            dist.all_reduce(_len_t, op=dist.ReduceOp.MAX)
+            global_max = int(_len_t.item())
+            if global_max > max_seq_len:
+                pad = global_max - max_seq_len
+                sequences = F.pad(sequences, (0, 0, 0, 0, 0, pad))       # pad seq dim
+                labels    = F.pad(labels,    (0, pad), value=-100)
+            max_seq_len = global_max
+
         M = self.agent.module.num_modalities if self.is_ddp else self.agent.num_modalities
         if args.use_device_wise_model:
             num_features = self.agent.module.num_device if self.is_ddp else self.agent.num_device
@@ -442,6 +475,8 @@ class AgentSequentialTrainer:
 
         # Process sequences in chunks of bptt_steps
         num_chunks = (max_seq_len + self.bptt_steps - 1) // self.bptt_steps
+
+        all_p_softs = []   # collect per-step p_soft [B, M] for viz
 
         for chunk_idx in range(num_chunks):
             # Get chunk boundaries
@@ -533,10 +568,17 @@ class AgentSequentialTrainer:
                     # Store memory for BPTT
                     chunk_mems.append(mem)
 
+                    # Always maintain a gradient-connected zero term so that even
+                    # fully-padded chunks (all label==-100) produce a tensor rooted
+                    # in model params.  AMP scaler and DDP hooks require at least one
+                    # backward pass through model parameters per chunk.
+                    if not isinstance(chunk_ce_loss, torch.Tensor):
+                        chunk_ce_loss = logits.sum() * 0.0
+
                     # Compute cross-entropy loss
                     if mask.any():
                         ce_loss = self.criterion(logits[mask], label[mask])
-                        chunk_ce_loss += ce_loss
+                        chunk_ce_loss = chunk_ce_loss + ce_loss
 
                         # Track accuracy
                         with torch.no_grad():
@@ -545,8 +587,6 @@ class AgentSequentialTrainer:
                             correct_count += correct
                             chunk_samples += mask.sum().item()
                             total_samples += mask.sum().item()
-                    else:
-                        pass
 
                     # Add gating loss if we used the agent
                     if p_soft is not None:
@@ -575,17 +615,18 @@ class AgentSequentialTrainer:
                             predictive_loss = self.compute_predictive_loss(emb_t, emb_t_plus_delta)
                             chunk_predictive_loss += predictive_loss
 
-            # Backward pass for this chunk (ONLY if we have valid samples)
-            if chunk_samples > 0:
-                # Combine losses
-                chunk_total_loss = (
-                        self.ce_weight * chunk_ce_loss +
-                        self.gating_weight * chunk_gating_loss +
-                        self.contrastive_weight * chunk_contrastive_loss +
-                        self.predictive_weight * chunk_predictive_loss
-                )
-            else:
-                chunk_total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            # Accumulate p_softs from this chunk for viz
+            all_p_softs.extend([ps.detach() for ps in chunk_p_softs])
+
+            # Combine losses. chunk_ce_loss is always a tensor connected to model
+            # params (guaranteed by the logits*0 seed above), so AMP scaler and DDP
+            # hooks always fire — even for fully-padded chunks.
+            chunk_total_loss = (
+                self.ce_weight * chunk_ce_loss +
+                self.gating_weight * chunk_gating_loss +
+                self.contrastive_weight * chunk_contrastive_loss +
+                self.predictive_weight * chunk_predictive_loss
+            )
 
             # print("111111", self.device, chunk_idx, num_chunks, chunk_samples)
             # Scale and backward
@@ -651,6 +692,12 @@ class AgentSequentialTrainer:
         accuracy = correct_count / total_samples if total_samples > 0 else 0.0
         avg_sensor_usage = total_sensor_usage / num_chunks if num_chunks > 0 else 0.0
 
+        # Mean p_soft per sensor across all windows [M]
+        if all_p_softs:
+            p_soft_per_sensor = torch.stack(all_p_softs).mean(0).mean(0).cpu().numpy()
+        else:
+            p_soft_per_sensor = None
+
         return {
             "loss": avg_total_loss,
             "ce_loss": avg_ce_loss,
@@ -662,7 +709,8 @@ class AgentSequentialTrainer:
             "total_samples": total_samples,
             "model_lr": self.model_optimizer.param_groups[0]['lr'],
             "agent_lr": self.agent_optimizer.param_groups[0]['lr'],
-            "predictive_lr": self.predictive_optimizer.param_groups[0]['lr'] if self.use_predictive_loss else 0.0
+            "predictive_lr": self.predictive_optimizer.param_groups[0]['lr'] if self.use_predictive_loss else 0.0,
+            "p_soft_per_sensor": p_soft_per_sensor,
         }
 
     @torch.no_grad()
@@ -685,6 +733,13 @@ class AgentSequentialTrainer:
 
         all_preds = []
         all_labels = []
+
+        # Gate timeline for visualization (first sequence only)
+        self._val_gate_seq  = None
+        self._val_label_seq = None
+        _seq0_gates  = []   # list of np [M] per step
+        _seq0_labels = []   # list of int per step
+        _first_batch_done = False
 
         # 是否使用 DistributedSampler（关键！）
         use_distributed_sampler = self.is_ddp and hasattr(self.val_loader.sampler, 'set_epoch')
@@ -742,6 +797,11 @@ class AgentSequentialTrainer:
 
                     total_sensor_usage += p_soft.mean().item()
                     sensor_usage_counts += 1
+
+                    # Collect gate timeline for first batch
+                    if not _first_batch_done and self.is_main_process:
+                        _seq0_gates.append(p_soft[0].cpu().numpy())
+                        _seq0_labels.append(label[0].item())
                 else:
                     window_masked = window
 
@@ -769,6 +829,12 @@ class AgentSequentialTrainer:
 
                         all_preds.append(preds.cpu())
                         all_labels.append(label[mask].cpu())
+
+            # After the first batch's sequence is done, freeze gate collection
+            if not _first_batch_done and _seq0_gates and self.is_main_process:
+                self._val_gate_seq  = np.stack(_seq0_gates)   # [T, M]
+                self._val_label_seq = np.array(_seq0_labels)  # [T]
+            _first_batch_done = True
 
         # ========== 关键：智能合并预测结果 ==========
         if all_preds:
@@ -873,6 +939,7 @@ class AgentSequentialTrainer:
 
             for batch_idx, batch in enumerate(self.train_loader):
                 metrics = self.train_step_bptt(batch)
+                self.global_step += 1
 
                 if metrics["total_samples"] > 0:
                     epoch_losses.append(metrics["loss"])
@@ -880,6 +947,13 @@ class AgentSequentialTrainer:
                     epoch_sensor_usages.append(metrics["sensor_usage"])
                     epoch_contrastive_losses.append(metrics["contrastive_loss"])
                     epoch_predictive_losses.append(metrics["predictive_loss"])
+
+                    # Visualizer step logging
+                    if (self.visualizer is not None and self.is_main_process
+                            and self.global_step % self.viz_interval == 0):
+                        p_soft_ms = metrics.get("p_soft_per_sensor")
+                        if p_soft_ms is not None:
+                            self.visualizer.log_step(self.global_step, {"p_soft": p_soft_ms})
 
                     if self.is_main_process and batch_idx % self.log_interval == 0:
                         log_msg = f"[{batch_idx}/{len(self.train_loader)}] loss={metrics['loss']:.4f}, " \
@@ -917,6 +991,19 @@ class AgentSequentialTrainer:
                         self.save_checkpoint("best_model.pth")
                     log_info(f"The best model's performance: val_acc={self.best_val_acc:.4f}, "
                              f"sensor_usage={val_metrics['val_sensor_usage']:.3f}")
+
+                    # Visualizer epoch / sequence logging
+                    if self.visualizer is not None and epoch_losses:
+                        train_m = {
+                            "ce_loss":      float(np.mean(epoch_losses)),
+                            "accuracy":     float(np.mean(epoch_accuracies)),
+                            "sensor_usage": float(np.mean(epoch_sensor_usages)),
+                        }
+                        self.visualizer.log_epoch(epoch, train_m, val_metrics)
+                        if self._val_gate_seq is not None:
+                            self.visualizer.log_val_sequence(
+                                epoch, self._val_gate_seq, self._val_label_seq)
+                        self.visualizer.generate_plots()
 
         if self.is_main_process:
             log_info("Training completed!")
@@ -1093,6 +1180,14 @@ if __name__ == "__main__":
     parser.add_argument('--preprocess_seizeit2', action='store_true',
                         help='Extract all SeizeIT2 windows to --preextracted_dir and exit. '
                              'Run once offline before training. Requires --root and --preextracted_dir.')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints',
+                        help='Directory to save model checkpoints.')
+    parser.add_argument('--visualize', action='store_true',
+                        help='Enable training visualization via PomdpVisualizer.')
+    parser.add_argument('--viz_dir', type=str, default='./viz',
+                        help='Directory to save visualization outputs.')
+    parser.add_argument('--viz_interval', type=int, default=50,
+                        help='Log a gate snapshot every N global steps.')
 
     args = parser.parse_args()
 
@@ -1433,6 +1528,7 @@ if __name__ == "__main__":
         "use_amp": True,
         "grad_clip_norm": 1.0,
         "val_interval": 1,
+        "save_dir": args.save_dir,
         "mem_context_cache_length": args.mem_context_cache_length,
         "use_contrastive_loss": args.use_contrastive_loss,
         "contrastive_weight": args.contrastive_weight,
@@ -1462,6 +1558,24 @@ if __name__ == "__main__":
             trainer_config=_trainer_config,
             ddp_config=ddp_config,
         )
+
+    if args.visualize and trainer.is_main_process:
+        from visualization.pomdp_viz import PomdpVisualizer
+        if args.use_device_wise_model:
+            # DeviceGatingAgent gates per channel (num_modalities = total channels)
+            gate_names = [f"{m.name}_{c}" for m in modalities for c in range(m.in_ch)]
+            gate_label  = "Channel"
+        else:
+            gate_names = [m.name for m in modalities]
+            gate_label  = "Sensor"
+        viz = PomdpVisualizer(
+            viz_dir=args.viz_dir,
+            num_sensors=len(gate_names),
+            sensor_names=gate_names,
+            gate_label=gate_label,
+            uncertainty_mode="none",
+        )
+        trainer.attach_visualizer(viz, viz_interval=args.viz_interval)
 
     trainer.train(num_epochs=args.num_epochs)
     trainer.cleanup()
