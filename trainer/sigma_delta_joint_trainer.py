@@ -140,6 +140,7 @@ class SigmaDeltaJointTrainer:
         # Loss weights
         ce_weight: float = 1.0,
         agent_sparsity_weight: float = 0.0,  # L1 penalty on p_soft.mean() — constrains agent_ratio
+        sd_sparsity_weight: float = 0.0,     # L1 penalty on active_ratio_soft — pushes log_threshold up
         predictive_weight: float = 0.0,      # optional self-supervised auxiliary
         # Misc
         save_dir: str = "./checkpoints_joint",
@@ -262,6 +263,7 @@ class SigmaDeltaJointTrainer:
         self.num_epochs       = num_epochs
         self.ce_weight             = ce_weight
         self.agent_sparsity_weight = agent_sparsity_weight
+        self.sd_sparsity_weight    = sd_sparsity_weight
         self.predictive_weight     = predictive_weight
         self.log_interval       = log_interval
         self.use_memory         = use_memory
@@ -283,6 +285,7 @@ class SigmaDeltaJointTrainer:
         self.epoch        = 0
         self.global_step  = 0
         self.best_val_acc = 0.0
+        self.best_val_agent_ratio = 0.0
         self._skip_history: List[Dict] = []   # per-epoch active_ratio per modality
 
         os.makedirs(save_dir, exist_ok=True)
@@ -353,8 +356,11 @@ class SigmaDeltaJointTrainer:
             self.predictive_opt.zero_grad(set_to_none=True)
 
         metrics = defaultdict(float)
-        n_valid  = 0
-        chunk_loss: Optional[torch.Tensor] = None  # accumulated across windows
+        n_valid         = 0
+        n_valid_windows = 0   # windows where valid.any() is True
+        n_agent_calls   = 0   # windows where agent was actually called
+        n_sd_windows    = 0   # valid windows where agent was active (uncontaminated sd_ratio denominator)
+        chunk_loss: Optional[torch.Tensor] = None  # accumulated, normalised by n_valid_windows before backward
 
         # ---- Forward through chunk --------------------------------------------
         # mem is already detached at the chunk boundary by the caller.
@@ -371,9 +377,13 @@ class SigmaDeltaJointTrainer:
                 prev_mem_for_agent = None
 
             # ---- Agent decision (uses memory from *previous* window) ----------
-            # Skip the first window of the chunk: no meaningful prev mem yet.
-            # This matches agent_trainer.py which gates only when i > start_idx.
-            if prev_mem_for_agent is not None and i > start:
+            # Gate whenever valid memory exists.  At the start of chunk 0,
+            # prev_mem_for_agent is None (cold-start), so the agent is
+            # naturally skipped.  For chunk 1+, prev_mem_for_agent is the
+            # detached memory from the previous chunk — gradient is already
+            # truncated, but the gate decision itself is still meaningful and
+            # must match validation behaviour.
+            if prev_mem_for_agent is not None:
                 with autocast(enabled=self.use_amp):
                     agent_out: AgentOutput = self.agent(
                         observation          = prev_mem_for_agent,
@@ -417,6 +427,7 @@ class SigmaDeltaJointTrainer:
 
                 agent_p_soft = agent_out.p_soft   # keep ref for sparsity penalty below
                 metrics["sensor_usage"] += agent_p_soft.mean().item()
+                n_agent_calls += 1
 
                 # Log effective τ (adaptive when uncertainty is available)
                 with torch.no_grad():
@@ -445,10 +456,12 @@ class SigmaDeltaJointTrainer:
             else:
                 agent_p_soft = None
                 current_belief_for_pred = None
-                window_gated = window   # no gating yet (cold start / first window of chunk)
+                window_gated = window   # cold start: no memory available yet
 
             # ---- Model forward -----------------------------------------------
-            context = torch.stack(mem_cache).mean(0) if (mem_cache and i > start) else None
+            # mem_cache entries are always detached before storing, so passing
+            # them as context never creates cross-chunk gradient chains.
+            context = torch.stack(mem_cache).mean(0) if mem_cache else None
 
             with autocast(enabled=self.use_amp):
                 out = self.model(window_gated, history=context)
@@ -496,19 +509,26 @@ class SigmaDeltaJointTrainer:
                     ce = self.criterion(logits[valid], label[valid])
                 metrics["ce_loss"] += ce.item()
                 n_valid += valid.sum().item()
+                n_valid_windows += 1
 
                 with torch.no_grad():
                     preds   = logits[valid].argmax(dim=-1)
                     correct = preds.eq(label[valid]).sum().item()
                 metrics["correct"] += correct
 
-                # Track sigma-delta active ratio
+                # Track sigma-delta active ratio — only for agent-active windows.
+                # When agent sets a device to 0, sigma-delta receives zero input:
+                # delta(0)≈0 → all patches triggered → active_ratio≈0, which would
+                # artificially deflate the metric. By gating on agent_p_soft, we report
+                # the true sd_ratio for windows where sigma-delta actually sees real signal.
                 # sigma_former_sensor uses "sparsity_losses"; sigma_former_device uses "active_ratios"
-                _ar_list = (sinfo or {}).get("sparsity_losses") or (sinfo or {}).get("active_ratios")
-                if _ar_list:
-                    ar = torch.stack([v if isinstance(v, torch.Tensor) else torch.tensor(v)
-                                      for v in _ar_list]).mean()
-                    metrics["active_ratio"] += ar.item()
+                if agent_p_soft is not None:
+                    _ar_list = (sinfo or {}).get("sparsity_losses") or (sinfo or {}).get("active_ratios")
+                    if _ar_list:
+                        ar = torch.stack([v if isinstance(v, torch.Tensor) else torch.tensor(v)
+                                          for v in _ar_list]).mean()
+                        metrics["active_ratio"] += ar.item()
+                        n_sd_windows += 1
 
                 # Sparsity penalty on agent gate
                 # Skipped in only_predictive mode: sparsity loss flows through
@@ -522,6 +542,23 @@ class SigmaDeltaJointTrainer:
                     window_loss = window_loss + self.agent_sparsity_weight * cur_ratio
                     metrics["sparsity_loss"] += cur_ratio.item()
 
+                # SD sparsity loss: differentiable pressure on log_threshold via active_ratio_soft.
+                # BypassMaskGrad returns None gradient to mask_pixel, so log_threshold has no
+                # gradient path through the masking operation itself. active_ratio_soft uses a
+                # sigmoid relaxation of (patch_activity < th) to provide a differentiable signal.
+                # CE loss pulls threshold down (don't skip too much); sd_sparsity_loss pushes it
+                # up (skip more). Equilibrium: threshold stabilises at a useful sparsity level.
+                # Only applied for agent-active windows (inactive windows have zero input →
+                # active_ratio_soft≈0 regardless of threshold, giving misleading gradient).
+                if (agent_p_soft is not None
+                        and self.sd_sparsity_weight > 0
+                        and not self.only_predictive):
+                    _ar_soft_list = (sinfo or {}).get("active_ratios_soft")
+                    if _ar_soft_list:
+                        ar_soft = torch.stack(_ar_soft_list).mean()  # differentiable
+                        window_loss = window_loss + self.sd_sparsity_weight * ar_soft
+                        metrics["sd_sparsity_loss"] += ar_soft.item()
+
                 # Add predictive auxiliary loss to window_loss
                 if pred_loss is not None:
                     window_loss = window_loss + self.predictive_weight * pred_loss
@@ -533,13 +570,16 @@ class SigmaDeltaJointTrainer:
 
         # ---- Single backward for entire chunk (BPTT through agent-model chain) --
         if chunk_loss is not None:
+            # Normalise by number of valid windows so gradient magnitude is
+            # independent of how many windows in the chunk have valid labels.
+            chunk_loss = chunk_loss / max(n_valid_windows, 1)
             self.scaler.scale(chunk_loss).backward()
 
             # ---- Gradient clipping + optimiser step ----------------------------
             # scaler.unscale_/step must only be called for optimisers whose params
             # actually received scaled gradients during backward.
             # We check dynamically after backward because:
-            #   - bptt_steps=1  → agent never called (i > start always False)
+            #   - bptt_steps=1  → agent called from window 1 onward
             #   - only_predictive=True → agent called
             #     but gate not applied to loss, so agent params have no grads
             self.scaler.unscale_(self.model_opt)
@@ -570,9 +610,17 @@ class SigmaDeltaJointTrainer:
             self.scaler.update()
 
         # ---- Normalise metrics -------------------------------------------------
-        denom = max(end - start, 1)
-        for k in ("ce_loss", "active_ratio", "sensor_usage", "mean_tau", "mean_uncertainty"):
-            metrics[k] /= denom
+        _vw  = max(n_valid_windows, 1)   # denominator for window-level metrics
+        _ac  = max(n_agent_calls,   1)   # denominator for agent-call metrics
+        _sdw = max(n_sd_windows,    1)   # denominator for sd metrics (agent-active valid windows only)
+        for k in ("ce_loss", "pred_loss", "sparsity_loss"):
+            metrics[k] /= _vw
+        # active_ratio and sd_sparsity_loss use n_sd_windows to avoid contamination
+        # from agent-inactive windows where sigma-delta sees zero input
+        for k in ("active_ratio", "sd_sparsity_loss"):
+            metrics[k] /= _sdw
+        for k in ("sensor_usage", "mean_tau", "mean_uncertainty"):
+            metrics[k] /= _ac
         if n_valid > 0:
             metrics["accuracy"] = metrics["correct"] / n_valid
 
@@ -648,13 +696,26 @@ class SigmaDeltaJointTrainer:
                 _tau_val  = np.mean(epoch_metrics.get("mean_tau",        [self._agent.get_temperature().item()]))
                 _unc_val  = np.mean(epoch_metrics.get("mean_uncertainty", [0.0]))
                 _unc_str  = f"  unc={_unc_val:.4f}" if self._agent.uncertainty_type not in ("none", "none_annealing") else ""
+                _sd_sp = np.mean(epoch_metrics.get("sd_sparsity_loss", [0.0]))
+                _sd_sp_str = f"  sd_sp={_sd_sp:.4f}" if self.sd_sparsity_weight > 0 else ""
+                # Print per-device (or per-channel) sigma-delta thresholds
+                _th_str = ""
+                if hasattr(self._model, "adaptive_sensing"):
+                    _th_parts = []
+                    for k in sorted(self._model.adaptive_sensing.keys()):
+                        th = self._model.adaptive_sensing[k].get_threshold()
+                        if th.numel() == 1:
+                            _th_parts.append(f"{th.item():.4f}")
+                        else:
+                            _th_parts.append("[" + " ".join(f"{v:.4f}" for v in th.tolist()) + "]")
+                    _th_str = f"  th=[{', '.join(_th_parts)}]"
                 _log(
                     f"  step {batch_idx:4d}  "
                     f"ce={np.mean(epoch_metrics.get('ce_loss', [0])):.4f}  "
                     f"acc={np.mean(epoch_metrics.get('accuracy', [0])):.3f}  "
                     f"sd_ratio={np.mean(epoch_metrics.get('active_ratio', [0])):.2%}  "
                     f"agent_ratio={np.mean(epoch_metrics.get('sensor_usage', [0])):.2%}  "
-                    f"τ={_tau_val:.3f}{_unc_str}"
+                    f"τ={_tau_val:.3f}{_unc_str}{_sd_sp_str}{_th_str}"
                 )
             batch_idx += 1
 
@@ -730,7 +791,7 @@ class SigmaDeltaJointTrainer:
                         gate = torch.cat(gate_parts, dim=1)
                     else:
                         C = window.shape[1]
-                        M = self.agent.num_sensors
+                        M = self._agent.num_sensors   # use _agent to unwrap DDP
                         gate = (
                             agent_out.p_soft
                             .unsqueeze(-1).unsqueeze(-1)
@@ -850,8 +911,9 @@ class SigmaDeltaJointTrainer:
                 # Save best checkpoint
                 if val_m and val_m.get("val_accuracy", 0) > self.best_val_acc:
                     self.best_val_acc = val_m["val_accuracy"]
+                    self.best_val_agent_ratio = val_m.get("val_sensor_usage", 0.0)
                     self.save_checkpoint("best_model.pt")
-                    _log(f"  ↑ Best val_acc={self.best_val_acc:.4f}")
+                    _log(f"  ↑ Best val_acc={self.best_val_acc:.4f}, agent_ratio={self.best_val_agent_ratio:.3f}")
 
                 # Save skip pattern history
                 with open(os.path.join(self.save_dir, "skip_patterns.json"), "w") as f:
@@ -868,7 +930,7 @@ class SigmaDeltaJointTrainer:
             self.visualizer.generate_plots()
 
         _log("Training complete.")
-        _log(f"Best val_accuracy : {self.best_val_acc:.4f}")
+        _log(f"Best val_accuracy : {self.best_val_acc:.4f}, agent_ratio={self.best_val_agent_ratio:.3f}")
 
     # ==========================================================================
     # Visualizer helper — collect one validation sequence gate timeline
@@ -994,6 +1056,10 @@ def _parse_args():
     p.add_argument("--ce_weight",             type=float, default=1.0)
     p.add_argument("--agent_sparsity_weight", type=float, default=0.0,
                    help="L1 penalty on agent p_soft.mean(). Increase to reduce agent_ratio.")
+    p.add_argument("--sd_sparsity_weight",   type=float, default=0.0,
+                   help="L1 penalty on sigma-delta active_ratio_soft (differentiable). "
+                        "Pushes log_threshold up → more patches skipped. "
+                        "CE loss provides counter-pressure. 0 = disabled (default).")
     p.add_argument("--predictive_weight",    type=float, default=0.0,
                    help="Weight for predictive auxiliary loss (belief → next model memory). "
                         "0 (default) = disabled. E.g. 0.1 trains GRU to be predictive of "
@@ -1077,17 +1143,23 @@ if __name__ == "__main__":
     #
     #   no_sigma_delta=F, use_device_wise=F  →  sigma_former_sensor + pomdp_sensor_agent + DeltaDataset
     #   no_sigma_delta=T, use_device_wise=F  →  former_sensor        + pomdp_sensor_agent
-    #   no_sigma_delta=F, use_device_wise=T  →  sigma_former_device  + pomdp_device_agent + DeltaDataset
+    #   no_sigma_delta=F, use_device_wise=T  →  sigma_former_device  + pomdp_device_agent (NO DeltaDataset)
     #   no_sigma_delta=T, use_device_wise=T  →  former_device        + pomdp_device_agent
     #
+    # NOTE: sigma_former_device.py's AdaptiveSensingModule already computes patch-level differences
+    # internally (delta_blocks = x_blocks - prev_blocks). Applying DeltaDataset on top causes
+    # double-differencing: delta(delta(x)) values are near-zero → patch_activity ≈ 0 → trigger fires
+    # on almost every patch → nearly all data skipped → ~30% accuracy.
+    # sigma_former_sensor.py needs DeltaDataset because its ConvTokenizer1D does cumsum(conv(delta))
+    # to reconstruct original features; sigma_former_device.py does NOT need this preprocessing.
     use_sigma  = not args.no_sigma_delta
     use_device = args.use_device_wise_model
-    apply_delta = use_sigma   # DeltaDataset only needed when sigma-delta is active
+    # apply_delta = use_sigma and not use_device   # DeltaDataset only for sensor-wise model (not device-wise)
 
     logging.info(
         f"Mode: {'sigma_former_device' if use_sigma and use_device else 'former_device' if use_device else 'sigma_former_sensor' if use_sigma else 'former_sensor'}  "
         f"+ {'pomdp_device_agent' if use_device else 'pomdp_sensor_agent'}  "
-        f"+ {'DeltaDataset' if apply_delta else 'raw signal'}"
+        f"+ {'raw signal'}"
     )
 
     # ---- Import dataset-specific loaders -----------------------------------
@@ -1106,7 +1178,7 @@ if __name__ == "__main__":
             # Device-wise: aligned with agent_trainer.py
             # Device 0 (left arm):  accel (3ch) + gyro (3ch) = 6 ch
             # Device 1 (right arm): accel (3ch) + gyro (3ch) = 6 ch
-            ds = MHealthDataset(args.root, subjects=list(range(0, 11)),
+            ds = MHealthDataset(args.root, subjects=list(range(1, 11)),
                                 time_steps=100, step=50, balance=False,
                                 majority_n=500)
             modalities = [
@@ -1118,9 +1190,9 @@ if __name__ == "__main__":
             ds = MHealthDataset(args.root, subjects=list(range(1, 11)),
                                 time_steps=50, step=25, balance=False)
             modalities = [ModalityConfig(f"m{i}", 1, 10) for i in range(13)]
-        # Apply DeltaDataset when sigma-delta sensing is active
-        if apply_delta:
-            ds = DeltaDataset(ds, axis=-1)
+        # # Apply DeltaDataset when sigma-delta sensing is active
+        # if apply_delta:
+        #     ds = DeltaDataset(ds, axis=-1)
 
         train_seq = SequentialDataset(ds, train_s)
         val_seq   = SequentialDataset(ds, val_s)
@@ -1176,9 +1248,9 @@ if __name__ == "__main__":
             modalities=('eeg', 'ecg', 'emg', 'imu'), balance=False,
         )
 
-        if apply_delta:
-            train_ds = DeltaDataset(train_ds, axis=-1)
-            val_ds   = DeltaDataset(val_ds,   axis=-1)
+        # if apply_delta:
+        #     train_ds = DeltaDataset(train_ds, axis=-1)
+        #     val_ds   = DeltaDataset(val_ds,   axis=-1)
 
         train_loader = DataLoader(
             train_ds, batch_size=args.batch_size, shuffle=True,
@@ -1210,15 +1282,16 @@ if __name__ == "__main__":
         # sigma_former_device: sigma-delta sensing, device-wise tokenisation
         from models.sigma_former_device import build_former_device as _build_sigma_device
         model = _build_sigma_device(
-            num_classes       = num_classes,
-            model_dim         = args.model_dim,
-            return_mem        = True,
-            return_sensing_info = True,
-            init_threshold    = args.init_threshold,
-            skip_steps        = args.skip_steps,
-            learnable_skip    = False,
-            modalities        = modalities,
-            modal_fusion      = args.modal_fusion,
+            num_classes           = num_classes,
+            model_dim             = args.model_dim,
+            return_mem            = True,
+            return_sensing_info   = True,
+            init_threshold        = args.init_threshold,
+            skip_steps            = args.skip_steps,
+            learnable_skip        = False,
+            modalities            = modalities,
+            modal_fusion          = args.modal_fusion,
+            threshold_granularity = args.device_gate_granularity,
         )
         agent_cls               = BeliefStatePOMDPDeviceAgent
         if args.device_gate_granularity == "modality":
@@ -1322,6 +1395,7 @@ if __name__ == "__main__":
         num_epochs             = args.num_epochs,
         ce_weight              = args.ce_weight,
         agent_sparsity_weight  = args.agent_sparsity_weight,
+        sd_sparsity_weight     = args.sd_sparsity_weight,
         predictive_weight      = args.predictive_weight,
         predictive_lr          = args.predictive_lr,
         save_dir               = args.save_dir,

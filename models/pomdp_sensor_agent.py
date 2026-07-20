@@ -665,7 +665,7 @@ if __name__ == "__main__":
     print("Smoke test: BeliefStatePOMDPAgent")
     print("=" * 65)
 
-    B, M, D, L, H = 4, 12, 512, 20, 256
+    B, M, D, L, H = 1, 12, 512, 20, 256
     agent = BeliefStatePOMDPAgent(
         num_sensors=M, obs_dim=D, hidden_dim=H,
         history_length=5, tau=1.0,

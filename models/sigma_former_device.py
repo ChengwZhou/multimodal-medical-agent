@@ -71,11 +71,16 @@ class AdaptiveSensingModule(nn.Module):
                  init_threshold: float = 0.5,
                  skip_steps: int = 1,          # now: number of patches to skip
                  learnable_skip: bool = False,
-                 min_threshold: float = 0.01,
-                 max_threshold: float = 5.0):
+                 min_threshold: float = 1e-4,
+                 max_threshold: float = 5.0,
+                 num_channels: int = 1):        # >1 → per-channel threshold (channel granularity)
         super().__init__()
         self.patch_size = patch_size
-        self.log_threshold = nn.Parameter(torch.tensor(math.log(init_threshold)))
+        # log_threshold shape: [num_channels] — scalar when num_channels=1 (modality-level),
+        # per-channel vector when num_channels=C (channel-level granularity)
+        self.log_threshold = nn.Parameter(
+            torch.full((num_channels,), math.log(init_threshold))
+        )
         self.min_threshold = min_threshold
         self.max_threshold = max_threshold
 
@@ -126,15 +131,16 @@ class AdaptiveSensingModule(nn.Module):
         delta_x = delta_blocks.transpose(1, 2).contiguous()  # [B, L, C_in, P] → [B, C_in, L, P]
         delta_x = delta_x.view(B, C, -1)  # [B, C_in, T]
 
-        # threshold
-        th = self.get_threshold()  # scalar
+        # threshold: [num_channels] — either [1] (modality-level) or [C] (channel-level)
+        th = self.get_threshold()             # [num_channels]
+        th_bc = th.view(1, 1, -1)            # [1, 1, C] — broadcasts with [B, L, C]
         abs_delta = torch.abs(delta_blocks)  # [B, L, C, P]
 
         # Calculate patch activity（mean over patch）
         patch_activity = abs_delta.mean(dim=-1)  # [B, L, C]
 
-        # hard trigger: entire patch average < th → trigger
-        trigger = patch_activity < th  # [B, L, C]  bool
+        # hard trigger: entire patch average < th → trigger (per-channel threshold)
+        trigger = patch_activity < th_bc  # [B, L, C]  bool
 
         # skip logic (per patch, per channel)
         skip = self.get_skip_steps()  # int
@@ -179,18 +185,18 @@ class AdaptiveSensingModule(nn.Module):
         active_mean = active.mean()
         active_ratio = active_hard.mean()
 
-        # --------------------------------------------------------------- #
-        # Debug print
-        # --------------------------------------------------------------- #
-        # print(f"active_hard shape: {active_hard.shape}")  # [B, L, C]
-        # print(f"mask_pixel shape: {mask_pixel.shape}")  # [B, C, T]
-        # print(f"mask_hard shape: {mask_hard.shape}")  # [B, C, T]
-        # print(f"masked_delta shape: {masked_delta.shape}")  # [B, C, T]
-        # print(f"trigger[0]:", trigger[0])  # [L, C]
-        # print(f"active_hard[0]:", active_hard[0])  # [L, C]
-        # print("masked_delta[0,0]:", masked_delta[0, 0])
+        # Differentiable approximation of active_ratio for gradient to log_threshold.
+        # BypassMaskGrad returns None gradient for mask_pixel, so log_threshold receives
+        # no gradient through the forward masking path. This soft approximation provides
+        # a differentiable loss signal:
+        #   trigger_soft ≈ P(patch is triggered/skipped), via sigmoid relaxation of (activity < th)
+        #   active_ratio_soft = 1 - mean(trigger_soft)  ← differentiable w.r.t. log_threshold
+        # Use this with sd_sparsity_weight loss in the trainer to let threshold learn.
+        sigma_temp = torch.clamp(th.detach().view(1, 1, -1) * 0.1, min=1e-4)  # [1, 1, C]
+        trigger_soft = torch.sigmoid((th_bc - patch_activity) / sigma_temp)  # [B, L, C]
+        active_ratio_soft = 1.0 - trigger_soft.mean()  # in [0,1]; grad flows to log_threshold
 
-        return masked_delta, mask_hard, active_mean, active_ratio
+        return masked_delta, mask_hard, active_mean, active_ratio, active_ratio_soft
 
 class ConvTokenizer1D(nn.Module):
     """
@@ -260,7 +266,8 @@ class MultimodalActivityTransformer(nn.Module):
         skip_steps: int = 5,
         learnable_skip: bool = False,
         return_sensing_info: bool = False,
-        modal_fusion: str = "concate"  # "concate" or "cross_atten",
+        modal_fusion: str = "concate",  # "concate" or "cross_atten"
+        threshold_granularity: str = "modality",  # "modality" = one th per device, "channel" = one th per channel
     ):
         super().__init__()
 
@@ -292,11 +299,13 @@ class MultimodalActivityTransformer(nn.Module):
             total_in_ch = sum(m.in_ch for m in mods)
             patch_size = mods[0].patch_size  # assume all same per sensor
             self.sensor_tokenizers[str(device_idx)] = ConvTokenizer1D(total_in_ch, out_ch=model_dim, patch_size=patch_size)
+            _n_th_ch = total_in_ch if threshold_granularity == "channel" else 1
             self.adaptive_sensing[str(device_idx)] = AdaptiveSensingModule(
                 patch_size=patch_size,
                 init_threshold=init_threshold,
                 skip_steps=skip_steps,
-                learnable_skip=learnable_skip
+                learnable_skip=learnable_skip,
+                num_channels=_n_th_ch,
             )
 
             self.sensor_ranges[device_idx] = (start_ch, start_ch + total_in_ch)
@@ -353,7 +362,7 @@ class MultimodalActivityTransformer(nn.Module):
         history: expected [B, 1, 140] OR [B, 140, 1] (we handle both)
         """
         per_sensor_tokens = []
-        sensing_info = {'masks': [], 'active_st': [], 'active_ratios': []}
+        sensing_info = {'masks': [], 'active_st': [], 'active_ratios': [], 'active_ratios_soft': []}
 
         # iterate sensors and tokenize each
         for device_idx in sorted(self.sensor_ranges.keys()):
@@ -361,17 +370,13 @@ class MultimodalActivityTransformer(nn.Module):
             ch = x[:, start:end, :]                # [B, total_in_ch, T]
             # print(str(device_idx))
             # Apply adaptive sensing
-            masked_ch, mask, active_st, active_ratio = self.adaptive_sensing[str(device_idx)](ch)  # [B, 1, T], [B, 1, T]
-            #
-            # mask = torch.tensor(0).to(x.device)
-            # active_st = torch.tensor(0).to(x.device)
-            # active_ratio = torch.tensor(0).to(x.device)
-            # # Store sensing info
+            masked_ch, mask, active_st, active_ratio, active_ratio_soft = self.adaptive_sensing[str(device_idx)](ch)
             if self.return_sensing_info:
                 sensing_info['masks'].append(mask)
                 sensing_info['active_st'].append(active_st.float().mean())
-                active_ratio = mask.float().mean()
-                sensing_info['active_ratios'].append(active_ratio)
+                sensing_info['active_ratios'].append(mask.float().mean())
+                # active_ratio_soft: differentiable proxy for active_ratio (gradient flows to log_threshold)
+                sensing_info['active_ratios_soft'].append(active_ratio_soft)
 
             # Tokenize masked input
             t = self.sensor_tokenizers[str(device_idx)](masked_ch)    # [B, L=10, out_ch=model_dim]
@@ -427,7 +432,8 @@ def build_former_device(num_modal=14,
                         learnable_skip: bool = False,
                         return_sensing_info: bool = False,
                         modalities=None,
-                        modal_fusion="concate"):
+                        modal_fusion="concate",
+                        threshold_granularity: str = "modality"):
     return MultimodalActivityTransformer(
         num_classes=num_classes,
         model_dim=model_dim,
@@ -444,7 +450,8 @@ def build_former_device(num_modal=14,
         skip_steps=skip_steps,
         learnable_skip=learnable_skip,
         return_sensing_info=return_sensing_info,
-        modal_fusion=modal_fusion
+        modal_fusion=modal_fusion,
+        threshold_granularity=threshold_granularity,
     )
 
 

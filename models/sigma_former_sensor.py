@@ -490,10 +490,10 @@ if __name__ == "__main__":
     # x = torch.ones(8, 14, 100)  # [B, 14, T]
     # x = torch.zeros(8, 2, 100)
     # x[:, :, 0] = 1
-    x = torch.randn(8, 2, 100)
+    x = torch.randn(1, 2, 100)
     print(x.size())
-    history = torch.randn(8, 140, 512)  # [B, L_total, model_dim]
-    history_mask = torch.randn(8, 140, 512)  # [B, L_total, model_dim]
+    history = torch.randn(1, 140, 512)  # [B, L_total, model_dim]
+    history_mask = torch.randn(1, 140, 512)  # [B, L_total, model_dim]
 
     logits, mem, sensing_info = model_fixed(x, history=history, history_mask=history_mask)
     print(f"  Logits shape: {logits.shape}")  # [8, 12]

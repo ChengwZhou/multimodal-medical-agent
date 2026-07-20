@@ -241,6 +241,8 @@ class AgentSequentialTrainer:
         self.step = 0
         self.epoch = 0
         self.best_val_acc = 0.0
+        self.best_val_sd_ratio = 0.0
+        self.best_val_agent_ratio = 0.0
 
         # Loss function
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
@@ -428,7 +430,7 @@ class AgentSequentialTrainer:
             end_idx = min(start_idx + self.bptt_steps, max_seq_len)
             chunk_size = end_idx - start_idx
 
-            if chunk_size <= 1:
+            if chunk_size == 0:
                 continue
 
             # Zero gradients at start of each BPTT chunk
@@ -444,6 +446,8 @@ class AgentSequentialTrainer:
             chunk_contrastive_loss = 0.0
             chunk_predictive_loss = 0.0
             chunk_samples = 0
+            n_valid_windows = 0   # windows with at least one valid label
+            n_agent_calls   = 0   # windows where agent was actually invoked
 
             # Store intermediate states for BPTT
             chunk_mems = []
@@ -459,8 +463,12 @@ class AgentSequentialTrainer:
                 if not mask.any():
                     continue
 
-                # If we have memory from previous window, use agent to get gating
-                if mem is not None and i > start_idx:
+                # If we have memory from previous window, use agent to get gating.
+                # Gate whenever memory exists: chunk 0 starts with mem=None (natural
+                # cold-start skip); chunk 1+ starts with detached mem from previous
+                # chunk — gradient is truncated but gate decision is still applied,
+                # matching validation behaviour.
+                if mem is not None:
                     # Agent decides which sensors to use based on previous memory
                     with autocast(enabled=self.use_amp):
                         agent_output = self.agent(
@@ -492,15 +500,18 @@ class AgentSequentialTrainer:
                     ], dim=1)
 
                     chunk_p_softs.append(p_soft)
+                    n_agent_calls += 1
                 else:
-                    # First window or no memory yet - use all sensors
+                    # Cold start: no memory available yet
                     window_masked = window
                     p_st = None
                     p_soft = None
 
                 # Forward through model
+                # mem_running_context is always detached before storing, so passing
+                # it here never creates cross-chunk gradient chains.
                 with autocast(enabled=self.use_amp):
-                    logits, mem, sensing_info = self.model(window_masked, mem_running_context if i > start_idx else None)
+                    logits, mem, sensing_info = self.model(window_masked, mem_running_context)
 
                     # Store memory for context input (detached)
                     if mem_running_context is None:
@@ -517,6 +528,7 @@ class AgentSequentialTrainer:
                     if mask.any():
                         ce_loss = self.criterion(logits[mask], label[mask])
                         chunk_ce_loss += ce_loss
+                        n_valid_windows += 1
 
                         # Track accuracy
                         with torch.no_grad():
@@ -563,14 +575,18 @@ class AgentSequentialTrainer:
 
             # Backward pass for this chunk
             if chunk_samples > 0:
-                # Combine losses
+                # Normalise each term so gradient magnitude is independent of chunk
+                # occupancy.  SD_active_loss uses chunk_size (accumulated per step,
+                # not per valid window).
+                _vw = max(n_valid_windows, 1)
+                _ac = max(n_agent_calls,   1)
                 chunk_SD_active_loss = chunk_SD_active_loss / chunk_size
                 chunk_total_loss = (
-                        self.ce_weight * chunk_ce_loss +
-                        self.gating_weight * chunk_gating_loss +
-                        self.SD_active_weight * chunk_SD_active_loss +
-                        self.contrastive_weight * chunk_contrastive_loss +
-                        self.predictive_weight * chunk_predictive_loss
+                        self.ce_weight          * chunk_ce_loss          / _vw +
+                        self.gating_weight      * chunk_gating_loss      / _ac +
+                        self.SD_active_weight   * chunk_SD_active_loss +
+                        self.contrastive_weight * chunk_contrastive_loss / _vw +
+                        self.predictive_weight  * chunk_predictive_loss  / _vw
                 )
 
                 # Scale and backward
@@ -856,15 +872,18 @@ class AgentSequentialTrainer:
                          f"sensor_usage={epoch_sensors:.3f}, contrastive_loss={epoch_contrastive:.4f}, "
                          f"predictive_loss={epoch_predictive:.4f}, time={epoch_time:.1f}s")
 
-            if self.step % self.val_interval == 0 and self.val_dataset:
+            if epoch % self.val_interval == 0 and self.val_dataset:
                 val_metrics = self.validate()
                 if self.is_main_process:
                     log_info(f"Epoch {epoch} Validation: {val_metrics}")
                     if val_metrics.get("val_accuracy", 0) > self.best_val_acc:
                         self.best_val_acc = val_metrics["val_accuracy"]
+                        self.best_val_sd_ratio = val_metrics.get("avg_sensor_SD_active_ratio", 0.0)
+                        self.best_val_agent_ratio = val_metrics.get("val_sensor_usage", 0.0)
                         self.save_checkpoint("best_model.pth")
                     log_info(f"The best model's performance: val_acc={self.best_val_acc:.4f}, "
-                             f"sensor_usage={val_metrics['val_sensor_usage']:.3f}")
+                             f"sd_ratio={self.best_val_sd_ratio:.3f}, "
+                             f"agent_ratio={self.best_val_agent_ratio:.3f}")
 
         if self.is_main_process:
             log_info("Training completed!")
