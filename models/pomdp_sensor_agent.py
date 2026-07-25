@@ -164,6 +164,9 @@ class BeliefStatePOMDPAgent(nn.Module):
         tau_min: float = 0.1,          # τ floor for "none_annealing" mode
         tau_anneal_steps: int = 5000,  # steps over which τ decays from tau → tau_min
         modal_per: int = 64,           # per-modality embedding dim for direct policy input
+        gate_init_bias: float = 2.0,   # initial bias of policy_head output layer
+                                       # 2.0  → sigmoid(2)≈0.88  (slightly biased open)
+                                       # 5.0  → sigmoid(5)≈0.99  (essentially all-open)
         # Uncertainty-aware exploration
         uncertainty_type: str = "none",   # "none" | "logit" | "none_annealing"
         uncertainty_scale: float = 1.0,   # how strongly uncertainty widens per-sensor τ
@@ -234,7 +237,7 @@ class BeliefStatePOMDPAgent(nn.Module):
         #             Much better dynamic range than sigmoid(-|logit|):
         #               logit=1 → 0.78, logit=2 → 0.53, logit=3 → 0.29  (vs 0.27/0.12/0.05)
         policy_in = hidden_dim + hidden_dim // 2 + num_sensors * modal_per
-        self.policy_head = self._build_policy_head(policy_in, hidden_dim, num_sensors)
+        self.policy_head = self._build_policy_head(policy_in, hidden_dim, num_sensors, gate_init_bias)
 
         # value_head removed: it was used only for REINFORCE baseline, but the
         # trainer uses STE + CE gradients exclusively — value_head output was
@@ -251,6 +254,7 @@ class BeliefStatePOMDPAgent(nn.Module):
         policy_in: int,
         hidden_dim: int,
         num_sensors: int,
+        gate_init_bias: float = 2.0,
     ) -> nn.Sequential:
         """Shared policy MLP for 'none' mode: policy_in → hidden → hidden/2 → M."""
         head = nn.Sequential(
@@ -258,7 +262,7 @@ class BeliefStatePOMDPAgent(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2), nn.GELU(),
             nn.Linear(hidden_dim // 2, num_sensors),
         )
-        nn.init.constant_(head[-1].bias, 2.0)
+        nn.init.constant_(head[-1].bias, gate_init_bias)
         return head
 
 

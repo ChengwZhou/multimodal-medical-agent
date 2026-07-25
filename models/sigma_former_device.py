@@ -16,32 +16,29 @@ from collections import defaultdict
 # -----------------------------
 
 class BypassMaskGrad(torch.autograd.Function):
+    """
+    Straight-Through Estimator (STE) for the sigma-delta hard mask.
+
+    Forward : apply hard binary mask  ->  delta_x * mask_pixel
+    Backward: gradient passes straight through the mask (as if mask = 1 everywhere).
+
+    Rationale:
+    - The original bypass heuristic sent skipped-patch gradients to prev_delta_x,
+      causing conv weights to receive gradients from the wrong spatial position.
+    - STE is the standard way to backprop through discrete/hard operations:
+      the hard mask controls what the model sees (forward),
+      while the gradient ignores the mask so all positions can learn (backward).
+    - log_threshold gradient is handled separately via active_ratio_soft (sigmoid
+      relaxation), so BypassMaskGrad no longer needs to serve that purpose.
+    """
     @staticmethod
-    def forward(ctx, delta_x, mask_pixel, prev_delta_x):
-        ctx.save_for_backward(mask_pixel)
-        ctx.prev_delta_x = prev_delta_x
+    def forward(ctx, delta_x, mask_pixel):
         return delta_x * mask_pixel
 
     @staticmethod
     def backward(ctx, grad_output):
-        mask_pixel, = ctx.saved_tensors
-        prev_delta_x = ctx.prev_delta_x
-
-        # Normal gradient：grad_delta_x = grad_output * mask_pixel
-        grad_delta_x = grad_output * mask_pixel
-
-        # The masked portion has its gradient “bypassed” to the previous patch.
-        bypass_mask = (mask_pixel < 0.5).float()
-        grad_bypass = grad_output * bypass_mask
-
-        # Add the bypass gradient to the previous patch (dimensions must be aligned).
-        if prev_delta_x is not None:
-            grad_prev = grad_bypass  # [B, C, T]，Align to prev patch
-            # If patches do not overlap, they can be added directly; if they overlap, they must be unfolded and aligned.
-        else:
-            grad_prev = None
-
-        return grad_delta_x, None, grad_prev
+        # STE: pass gradient straight through — delta_x grad is unmasked
+        return grad_output, None
 
 
 class PositionalEncoding(nn.Module):
@@ -170,11 +167,8 @@ class AdaptiveSensingModule(nn.Module):
         active_expanded = active_expanded.permute(0, 2, 1, 3).contiguous()  # [B, C, L, P]
         mask_pixel = active_expanded.view(B, C, T)  # [B, C, T]
 
-        # Save prev_delta_x (pixel-level)
-        prev_delta_x = prev_blocks.permute(0, 2, 1, 3).contiguous().view(B, C, T)
-
-        # Using Custom Gradients
-        masked_delta = BypassMaskGrad.apply(delta_x, mask_pixel, prev_delta_x)
+        # STE mask application: forward uses hard mask, backward passes gradient through
+        masked_delta = BypassMaskGrad.apply(delta_x, mask_pixel)
 
         # hard mask (0/1) - Apply the same dimensionality transformation
         active_hard_expanded = active_hard.unsqueeze(-1).expand(-1, -1, -1, P)  # [B, L, C, P]
